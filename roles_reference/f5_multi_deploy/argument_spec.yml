@@ -1,0 +1,174 @@
+---
+# Variable contract for f5_multi_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). common_name/subject_alt_names
+# are NOT set at the top level here -- they're supplied per BIG-IP target
+# inside deploy_targets instead; see this playbook's own header comment in
+# main.yml for the full per-target schema. See f5_deploy/argument_spec.yml
+# for the single-target equivalent.
+# Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: bigip_port
+    type: int
+    required: false
+    default: 443
+    secret: false
+    description: Shared BIG-IP management API port, used when a target doesn't set its own bigip_port.
+    choices: null
+
+  - name: bigip_user
+    type: str
+    required: false
+    default: null
+    secret: false
+    description: >-
+      Shared BIG-IP admin username, used when a target doesn't set its own
+      bigip_user. No default -- supply this or a per-target bigip_user.
+    choices: null
+
+  - name: bigip_password
+    type: str
+    required: false
+    default: null
+    secret: true
+    description: >-
+      Shared BIG-IP admin password, used when a target doesn't set its own
+      bigip_password. No default -- supply this or a per-target bigip_password.
+    choices: null
+
+  - name: bigip_validate_certs
+    type: bool
+    required: false
+    default: true
+    secret: false
+    description: Set false only for a lab BIG-IP with a self-signed management cert.
+    choices: null
+
+  - name: partition
+    type: str
+    required: false
+    default: "Common"
+    secret: false
+    description: Shared BIG-IP partition, used when a target doesn't set its own partition.
+    choices: null
+
+  - name: f5_cert_staging_dir
+    type: str
+    required: false
+    default: "/etc/certsecure/acme/f5-staging"
+    secret: false
+    description: >-
+      Directory on the Ansible control node the certificate is issued to
+      before being uploaded to the BIG-IP and removed again.
+    choices: null
+
+  - name: deploy_targets
+    type: list
+    required: true
+    default: null
+    secret: true
+    description: >-
+      One entry per BIG-IP virtual server / client-SSL profile to update.
+      No default -- always supply via extraVars.
+    choices: null
+    options:
+      - name: bigip_host
+        type: str
+        required: true
+        default: null
+        secret: false
+        description: BIG-IP management IP/FQDN for this target.
+        choices: null
+      - name: bigip_port
+        type: int
+        required: false
+        default: null
+        secret: false
+        description: BIG-IP management API port for this target. Falls back to the shared bigip_port.
+        choices: null
+      - name: bigip_user
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: BIG-IP admin username for this target. Falls back to the shared bigip_user.
+        choices: null
+      - name: bigip_password
+        type: str
+        required: false
+        default: null
+        secret: true
+        description: BIG-IP admin password for this target. Falls back to the shared bigip_password.
+        choices: null
+      - name: bigip_validate_certs
+        type: bool
+        required: false
+        default: null
+        secret: false
+        description: Falls back to the shared bigip_validate_certs.
+        choices: null
+      - name: partition
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: BIG-IP partition for this target. Falls back to the shared partition.
+        choices: null
+      - name: common_name
+        type: str
+        required: true
+        default: null
+        secret: false
+        description: Primary domain/CN to request and install on this BIG-IP.
+        choices: null
+      - name: subject_alt_names
+        type: list
+        required: false
+        default: []
+        secret: false
+        description: Extra SANs beyond common_name for this target.
+        choices: null
+      - name: ssl_cert_name
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: >-
+          BIG-IP object name for the uploaded certificate/key pair. Defaults
+          to common_name.
+        choices: null
+      - name: client_ssl_profile_name
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: >-
+          Client-SSL profile to create/update with the new cert/key. Defaults
+          to "<ssl_cert_name>-clientssl".
+        choices: null
+      - name: virtual_server_name
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: >-
+          Attach client_ssl_profile_name to this virtual server's clientSSL
+          profile list if not already attached. Leave unset if the profile is
+          already attached and this run only rotates the cert/key it points at.
+        choices: null
+      - name: verify_host
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: Host to TLS-probe for the post-deploy verification check. Defaults to common_name.
+        choices: null
+      - name: verify_port
+        type: int
+        required: false
+        default: 443
+        secret: false
+        description: Port to TLS-probe for the post-deploy verification check. Set to "" to skip.
+        choices: null

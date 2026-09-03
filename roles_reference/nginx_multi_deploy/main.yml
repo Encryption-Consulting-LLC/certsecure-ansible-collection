@@ -1,0 +1,154 @@
+---
+# CertSecure ACME renewal playbook -- nginx, explicit multi-server
+#
+# Same two ACME flows as roles_reference/nginx_deploy/main.yml (see that
+# file's header and docs/design/acme-playbook-variables.md for the full
+# contract). The difference is entirely in how targets are supplied: instead
+# of relying on servers already being registered as hosts in AAP's own
+# Inventory (which every other playbook in this collection assumes via
+# `hosts: all` + AAP's `limit`), this playbook takes an explicit list of
+# servers via the `deploy_targets` variable and builds its own throwaway
+# inventory at run time -- nothing needs to be pre-registered in AAP at all.
+#
+# CertSecure's own batch launch mode (`hosts: [{host, variables}, ...]` on
+# POST /jobs/launch / POST .../schedules, see
+# docs/design/acme-playbook-variables.md) still requires every host to
+# already exist in AAP's Inventory, since it works by setting AAP's `limit`
+# per launch -- one AAP job per host. Use *this* playbook instead when you
+# want ONE job run to renew certs across many nginx servers AAP doesn't (or
+# shouldn't need to) know about as Inventory hosts. Launch the Job Template
+# against any placeholder inventory containing just one host (e.g.
+# "localhost", local connection) -- the real targets and their connection
+# details travel entirely inside extraVars as `deploy_targets`.
+#
+# `deploy_targets` is a list of objects, one per nginx server:
+#   host                          (required) dynamic inventory name, and the
+#                                 default for ansible_host/common_name below
+#   ansible_host                  actual IP/FQDN to connect to, if different
+#                                 from `host`
+#   ansible_user / ansible_port / ansible_ssh_private_key_file /
+#   ansible_password / ansible_become_password
+#                                 per-server connection overrides -- since
+#                                 these hosts are never in AAP Inventory,
+#                                 connection details must come from here
+#   common_name                   defaults to `host`
+#   subject_alt_names             defaults to []
+#   reload_command / preflight_validation_command / cert_file_owner /
+#   cert_file_group / cert_file_mode / verify_port
+#                                 same meaning as nginx_deploy's own
+#                                 variables (see this directory's
+#                                 argument_spec.yml) -- per-server override,
+#                                 falls back to this playbook's own defaults
+#                                 below when omitted
+#
+# Everything else (acme_flow, acme_account_email, the private/public flow
+# variables, enrollment variables) is shared across the whole run -- set once
+# via vars_files/extraVars, same as every other playbook in this collection.
+#
+# This file (roles_reference/nginx_multi_deploy/main.yml) is the untouched,
+# shipped baseline -- replaced wholesale by every CertSecure release. A
+# manual/emergency override goes in roles/nginx_multi_deploy/main.yml instead
+# (empty by default, not preserved across an upgrade); an edit saved via
+# PUT /aapIntegration/playbooks/files/nginx_multi_deploy is stored in MongoDB
+# and survives upgrades. Both take precedence over this file -- see
+# roles/README.md for the full three-tier resolution order.
+
+- name: Build a throwaway inventory from deploy_targets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Assert deploy_targets is a non-empty list
+      assert:
+        that:
+          - deploy_targets is defined
+          - deploy_targets | length > 0
+        fail_msg: >-
+          deploy_targets must be a non-empty list of {host, ...} objects --
+          see this playbook's header comment for the full per-server schema.
+
+    - name: Register each explicit server as a dynamic inventory host
+      add_host:
+        name: "{{ item.host }}"
+        groups: nginx_multi_targets
+        ansible_host: "{{ item.ansible_host | default(item.host) }}"
+        ansible_user: "{{ item.ansible_user | default(omit) }}"
+        ansible_port: "{{ item.ansible_port | default(omit) }}"
+        ansible_ssh_private_key_file: "{{ item.ansible_ssh_private_key_file | default(omit) }}"
+        ansible_password: "{{ item.ansible_password | default(omit) }}"
+        ansible_become_password: "{{ item.ansible_become_password | default(omit) }}"
+        _target_common_name: "{{ item.common_name | default(item.host) }}"
+        _target_subject_alt_names: "{{ item.subject_alt_names | default([]) }}"
+        _target_reload_command: "{{ item.reload_command | default(omit) }}"
+        _target_preflight_validation_command: "{{ item.preflight_validation_command | default(omit) }}"
+        _target_cert_file_owner: "{{ item.cert_file_owner | default(omit) }}"
+        _target_cert_file_group: "{{ item.cert_file_group | default(omit) }}"
+        _target_cert_file_mode: "{{ item.cert_file_mode | default(omit) }}"
+        _target_verify_port: "{{ item.verify_port | default(omit) }}"
+      loop: "{{ deploy_targets }}"
+      loop_control:
+        label: "{{ item.host }}"
+      no_log: false
+
+- name: Issue/renew and install the certificate on every explicit nginx server
+  hosts: nginx_multi_targets
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    common_name: "{{ _target_common_name }}"
+    subject_alt_names: "{{ _target_subject_alt_names }}"
+    reload_command: "{{ _target_reload_command | default('systemctl reload nginx') }}"
+    preflight_validation_command: "{{ _target_preflight_validation_command | default('nginx -t') }}"
+    cert_file_owner: "{{ _target_cert_file_owner | default('root') }}"
+    cert_file_group: "{{ _target_cert_file_group | default('root') }}"
+    cert_file_mode: "{{ _target_cert_file_mode | default('0640') }}"
+    verify_port: "{{ _target_verify_port | default(443) }}"
+    nginx_ssl_dir: "/etc/nginx/ssl/{{ common_name }}"
+    acme_cert_file: "{{ nginx_ssl_dir }}/cert.pem"
+    acme_key_file: "{{ nginx_ssl_dir }}/key.pem"
+    acme_fullchain_file: "{{ nginx_ssl_dir }}/fullchain.pem"
+    acme_ca_file: "{{ nginx_ssl_dir }}/chain.pem"
+    acme_reload_cmd: "{{ reload_command }}"
+    acme_webroot_path: "/var/www/html"           # nginx's default docroot -- avoids acme.sh's --standalone HTTP-01
+                                                   # listener colliding with nginx already holding :80. Override per
+                                                   # target if the vhost's docroot differs.
+
+  tasks:
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      when: preflight_validation_command | length > 0
+      changed_when: false
+
+    - name: Issue/renew the certificate and install it for nginx
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+
+    - name: Set ownership/permissions on the installed certificate material
+      file:
+        path: "{{ item }}"
+        owner: "{{ cert_file_owner }}"
+        group: "{{ cert_file_group }}"
+        mode: "{{ cert_file_mode }}"
+      loop:
+        - "{{ acme_cert_file }}"
+        - "{{ acme_key_file }}"
+        - "{{ acme_fullchain_file }}"
+        - "{{ acme_ca_file }}"
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify nginx is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ verify_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check verify_port/common_name.') }}"

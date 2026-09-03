@@ -1,0 +1,105 @@
+---
+# CertSecure ACME renewal playbook -- IIS
+#
+# Same two flows as roles/nginx_deploy/main.yml (see that file's header and
+# docs/design/acme-playbook-variables.md for the full contract), using
+# Posh-ACME instead of acme.sh since this targets Windows. The issued
+# certificate is imported into the local machine's Personal store and bound
+# to the configured IIS site/port by thumbprint -- the old certificate for
+# that binding is left in the store (not deleted) so an in-flight connection
+# using it isn't yanked mid-handshake; clean up old thumbprints separately if
+# desired.
+#
+# This file (roles_reference/iis_deploy/main.yml) is the untouched, shipped
+# baseline -- see roles/README.md for the full three-tier resolution order
+# (a disk override under roles/iis_deploy/main.yml, or a Mongo-saved edit
+# from PUT /aapIntegration/playbooks/files/iis_deploy, both take precedence
+# over this file).
+
+- hosts: all
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    acme_pfx_dir: 'C:\CertSecure\acme\{{ common_name }}'
+    acme_pfx_file: '{{ acme_pfx_dir }}\{{ common_name }}.pfx'
+    iis_site_name: "Default Web Site"
+    iis_binding_ip: "*"
+    iis_binding_port: 443
+    acme_webroot_path: 'C:\inetpub\wwwroot'          # IIS's default docroot -- avoids Posh-ACME's WebSelfHost
+                                                       # standalone HTTP-01 listener colliding with IIS already
+                                                       # holding :80. Override per host/group if the site's
+                                                       # physical path differs.
+    verify_port: "{{ iis_binding_port }}"
+
+  tasks:
+    - name: Issue/renew the certificate for IIS
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_windows.yml"
+
+    # Posh-ACME's New-PACertificate -PfxPass does not reliably honor the
+    # password passed to it (observed: the exported PFX ends up encrypted
+    # with the literal text "System.Security.SecureString" -- the .ToString()
+    # of a SecureString object -- regardless of the real value supplied).
+    # Get-PACertificate's own PfxPass property always reflects whatever
+    # password Posh-ACME actually used, so read it back and use that for the
+    # import instead of trusting acme_pfx_password made it into the file.
+    - name: Read back the password Posh-ACME actually encrypted the PFX with
+      ansible.windows.win_shell: |
+        Import-Module Posh-ACME
+        $cert = Get-PACertificate -MainDomain "{{ common_name }}"
+        $cred = New-Object System.Management.Automation.PSCredential("x", $cert.PfxPass)
+        Write-Output $cred.GetNetworkCredential().Password
+      register: _actual_pfx_password
+      changed_when: false
+      no_log: false
+
+    - name: Import the PFX into the local machine Personal certificate store
+      ansible.windows.win_certificate_store:
+        path: "{{ acme_pfx_file }}"
+        password: "{{ _actual_pfx_password.stdout | trim }}"
+        key_exportable: false
+        key_storage: machine
+        store_location: LocalMachine
+        store_name: My
+        state: present
+      register: _iis_cert_import
+      no_log: false
+
+    - name: Ensure the IIS Web-Server feature's PowerShell module is available
+      ansible.windows.win_shell: Import-Module WebAdministration
+      changed_when: false
+
+    - name: Bind the renewed certificate to the site (creates the binding if missing)
+      ansible.windows.win_shell: |
+        Import-Module WebAdministration
+        $thumbprint = "{{ _iis_cert_import.thumbprints[0] }}"
+        $binding = Get-WebBinding -Name "{{ iis_site_name }}" -Protocol https -Port {{ iis_binding_port }} -ErrorAction SilentlyContinue
+        if (-not $binding) {
+          New-WebBinding -Name "{{ iis_site_name }}" -Protocol https -Port {{ iis_binding_port }} -IPAddress "{{ iis_binding_ip }}" -SslFlags 0
+          $binding = Get-WebBinding -Name "{{ iis_site_name }}" -Protocol https -Port {{ iis_binding_port }}
+        }
+        $binding.AddSslCertificate($thumbprint, "my")
+      changed_when: true
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify IIS is serving the new certificate
+      ansible.windows.win_shell: |
+        $req = [System.Net.HttpWebRequest]::Create("https://127.0.0.1:{{ verify_port }}/")
+        $req.ServerCertificateValidationCallback = { $true }
+        try {
+          $resp = $req.GetResponse()
+          $cert = $req.ServicePoint.Certificate
+          Write-Output $cert.GetExpirationDateString()
+          $resp.Close()
+        } catch {
+          Write-Output "Could not verify: $($_.Exception.Message)"
+        }
+      register: _verify_result
+      changed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | trim }}"

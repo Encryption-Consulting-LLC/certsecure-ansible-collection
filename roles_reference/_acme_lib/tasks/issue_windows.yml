@@ -1,0 +1,206 @@
+---
+# Windows equivalent of issue_linux.yml, using the Posh-ACME PowerShell
+# module. Same two flows (see roles/_acme_lib/vars/defaults.yml), but the
+# result lands as a single PFX (Posh-ACME's native output) rather than
+# separate cert/key/chain PEM files -- the calling playbook copies it from
+# acme_pfx_file into whatever the target app actually needs (e.g. the
+# Windows certificate store for IIS).
+#
+# Required from the calling playbook: common_name, acme_pfx_file,
+# acme_pfx_password.
+
+- name: Assert required per-host variables are set
+  assert:
+    that:
+      - common_name is defined and common_name | length > 0
+      - acme_pfx_dir is defined
+      - acme_pfx_file is defined
+      - acme_pfx_password is defined and acme_pfx_password | length > 0
+      - acme_account_email is defined and acme_account_email | length > 0
+    fail_msg: >-
+      common_name, acme_pfx_dir, acme_pfx_file, acme_pfx_password and
+      acme_account_email must all be set (by the calling playbook, or
+      overridden via extraVars/host_vars) before issue_windows.yml can run.
+      acme_account_email must be a real domain -- CertSecure's own ACME
+      server rejects non-routable placeholders like "automation@localhost".
+  no_log: false
+
+- name: Assert private-flow variables are set
+  assert:
+    that:
+      - certsecure_base_url is defined and 'REPLACE_WITH_CERTSECURE_BACKEND_URL' not in certsecure_base_url
+      - certsecure_eab_kid is defined and certsecure_eab_kid | length > 0
+      - certsecure_eab_hmac is defined and certsecure_eab_hmac | length > 0
+    fail_msg: >-
+      acme_flow=private requires certsecure_base_url, certsecure_eab_kid and
+      certsecure_eab_hmac -- generate an EAB profile via
+      POST /acme/generate_profile and pass its kid5/hmac as
+      certsecure_eab_kid/certsecure_eab_hmac.
+  when: acme_flow == 'private'
+  no_log: false
+
+- name: Assert public-flow variables are set
+  assert:
+    that:
+      - public_ca_directory_url is defined and public_ca_directory_url | length > 0
+      - dns_provider is defined and dns_provider | length > 0
+      - dns_provider_credentials is defined and dns_provider_credentials | length > 0
+    fail_msg: >-
+      acme_flow=public requires public_ca_directory_url, dns_provider and
+      dns_provider_credentials -- resolve these from a
+      CertSecure.ACME.URL / ACME.Domains entry before launching this job.
+  when: acme_flow == 'public'
+  no_log: false
+
+- name: Check whether the Posh-ACME module is already installed
+  ansible.windows.win_shell: |
+    if (Get-Module -ListAvailable -Name Posh-ACME) { "present" } else { "absent" }
+  register: _posh_acme_check
+  changed_when: false
+
+- name: Install the Posh-ACME module
+  ansible.windows.win_shell: |
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+    Install-Module -Name Posh-ACME -Scope AllUsers -Force -AllowClobber
+  when: "'absent' in _posh_acme_check.stdout"
+  changed_when: true
+
+- name: Work around a Posh-ACME bug where a non-string ACME error 'detail' crashes AcmeException's constructor
+  ansible.windows.win_shell: |
+    $modBase = (Get-Module -ListAvailable -Name Posh-ACME | Select-Object -First 1).ModuleBase
+    $exFile = Join-Path $modBase 'Private\AcmeException.ps1'
+    $lines = @(
+      'class AcmeException : System.Exception',
+      '{',
+      '    [PSObject]$Data',
+      '    AcmeException($Message,$Data,$Exception) : base( (& { if ($Message -is [string]) { $Message } elseif ($null -eq $Message) { "" } else { $Message | ConvertTo-Json -Compress -Depth 6 } }), $Exception) {',
+      '        $this.Data = $Data',
+      '    }',
+      '}'
+    )
+    Set-Content -Path $exFile -Value $lines -Force -Encoding UTF8
+    Write-Output "Patched: $exFile"
+  changed_when: true
+
+- name: Point Posh-ACME at CertSecure's own ACME server (private flow)
+  ansible.windows.win_shell: |
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    {% if not (certsecure_validate_certs | default(true) | bool) %}
+    if (-not ([System.Management.Automation.PSTypeName]'CertSecureTrustAllCertsPolicy').Type) {
+    Add-Type -TypeDefinition 'using System.Net; using System.Security.Cryptography.X509Certificates; public class CertSecureTrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; } }'
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object CertSecureTrustAllCertsPolicy
+    {% endif %}
+    Import-Module Posh-ACME
+    Set-PAServer -DirectoryUrl "{{ certsecure_acme_directory_url }}"
+  when: acme_flow == 'private'
+  changed_when: true
+
+- name: Point Posh-ACME at the public CA's ACME server (public flow)
+  ansible.windows.win_shell: |
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Import-Module Posh-ACME
+    Set-PAServer -DirectoryUrl "{{ public_ca_directory_url }}"
+  when: acme_flow == 'public'
+  changed_when: true
+
+- name: Build the SAN list as a PowerShell array literal
+  set_fact:
+    _paca_domain_list: >-
+      @("{{ common_name }}"{% for san in subject_alt_names %}, "{{ san }}"{% endfor %})
+
+- name: Request the certificate (private flow, HTTP-01)
+  ansible.windows.win_shell: |
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    {% if not (certsecure_validate_certs | default(true) | bool) %}
+    if (-not ([System.Management.Automation.PSTypeName]'CertSecureTrustAllCertsPolicy').Type) {
+    Add-Type -TypeDefinition 'using System.Net; using System.Security.Cryptography.X509Certificates; public class CertSecureTrustAllCertsPolicy : ICertificatePolicy { public bool CheckValidationResult(ServicePoint s, X509Certificate c, WebRequest r, int p) { return true; } }'
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object CertSecureTrustAllCertsPolicy
+    {% endif %}
+    Import-Module Posh-ACME
+    # New-PACertificate has no EAB parameters -- the account (with EAB) must
+    # be created explicitly via New-PAAccount first; New-PACertificate then
+    # uses whichever account is currently selected for this server.
+    New-PAAccount -AcceptTOS -Contact "{{ acme_account_email }}" -ExtAcctKID "{{ certsecure_eab_kid }}" -ExtAcctHMACKey "{{ certsecure_eab_hmac }}" -Force | Out-Null
+    $params = @{
+      Domain      = {{ _paca_domain_list }}
+      {% if acme_webroot_path | length > 0 %}
+      Plugin      = 'WebRoot'
+      PluginArgs  = @{ WRPath = "{{ acme_webroot_path }}" }
+      {% else %}
+      Plugin      = 'WebSelfHost'
+      {% endif %}
+      PfxPass     = (ConvertTo-SecureString "{{ acme_pfx_password }}" -AsPlainText -Force)
+      UseModernPfxEncryption = $false
+      Force       = $true
+    }
+    New-PACertificate @params
+  when: acme_flow == 'private'
+  register: _paca_private_result
+  changed_when: true
+  no_log: false
+
+- name: Request the certificate (public flow, DNS-01)
+  ansible.windows.win_shell: |
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Import-Module Posh-ACME
+    {% if public_ca_eab_kid | default('') | length > 0 %}
+    # New-PACertificate has no EAB parameters -- the account (with EAB) must
+    # be created explicitly via New-PAAccount first.
+    New-PAAccount -AcceptTOS -Contact "{{ acme_account_email }}" -ExtAcctKID "{{ public_ca_eab_kid }}" -ExtAcctHMACKey "{{ public_ca_eab_hmac }}" -Force | Out-Null
+    {% endif %}
+    $params = @{
+      Domain      = {{ _paca_domain_list }}
+      AcceptTOS   = $true
+      Contact     = "{{ acme_account_email }}"
+      Plugin      = "{{ posh_acme_dns_provider_map[dns_provider | lower] | default(dns_provider) }}"
+      PluginArgs  = @{ {% for key, value in (dns_provider_credentials | default({})).items() %}{{ key }} = "{{ value }}"{% if not loop.last %}; {% endif %}{% endfor %} }
+      DnsSleep    = {{ dns_propagation_wait }}
+      PfxPass     = (ConvertTo-SecureString "{{ acme_pfx_password }}" -AsPlainText -Force)
+      UseModernPfxEncryption = $false
+      Force       = $true
+    }
+    New-PACertificate @params
+  when: acme_flow == 'public'
+  register: _paca_public_result
+  changed_when: true
+  no_log: false
+
+- name: Read back the issued certificate's PFX path
+  ansible.windows.win_shell: |
+    Import-Module Posh-ACME
+    (Get-PACertificate -MainDomain "{{ common_name }}").PfxFile
+  register: _paca_pfx_path
+  changed_when: false
+
+# Posh-ACME writes plain PEM files alongside the PFX for every issuance --
+# read those back too so enroll_public_ca.yml has something to slurp on a
+# Windows target (it only knows the Linux acme_cert_file/acme_ca_file
+# variables, which this playbook family never sets for Windows hosts).
+- name: Read back the issued certificate's PEM cert file path
+  ansible.windows.win_shell: |
+    Import-Module Posh-ACME
+    (Get-PACertificate -MainDomain "{{ common_name }}").CertFile
+  register: _paca_cert_pem_path
+  changed_when: false
+
+- name: Read back the issued certificate's PEM chain file path
+  ansible.windows.win_shell: |
+    Import-Module Posh-ACME
+    $cert = Get-PACertificate -MainDomain "{{ common_name }}"
+    if ($cert.ChainFile) { $cert.ChainFile } else { $cert.FullChainFile }
+  register: _paca_chain_pem_path
+  changed_when: false
+
+- name: Ensure the destination directory exists
+  ansible.windows.win_file:
+    path: "{{ acme_pfx_dir }}"
+    state: directory
+
+- name: Copy the PFX to its final destination
+  ansible.windows.win_copy:
+    src: "{{ _paca_pfx_path.stdout | trim }}"
+    dest: "{{ acme_pfx_file }}"
+    remote_src: true

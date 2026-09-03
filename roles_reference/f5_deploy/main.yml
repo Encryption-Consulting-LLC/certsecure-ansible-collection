@@ -1,0 +1,181 @@
+---
+# CertSecure ACME renewal playbook -- F5 BIG-IP (client-SSL profile), single target
+#
+# F5 BIG-IP has no shell/SSH surface this collection can drive the way it
+# drives Linux/Windows app servers -- everything here goes over F5's own
+# iControl REST API via the `f5networks.f5_modules` collection, which is
+# NOT part of AAP's default execution environment: install it into whatever
+# EE this Job Template runs under (`ansible-galaxy collection install
+# f5networks.f5_modules`, or add it to that EE's requirements.yml) before
+# using this playbook. Every F5-facing task below therefore runs on
+# `localhost` -- the "target" is the BIG-IP's management API, not a machine
+# Ansible connects to over SSH/WinRM. Launch the Job Template against any
+# placeholder inventory (e.g. just "localhost") -- bigip_host/common_name/etc.
+# below are the real target, not AAP's own Inventory/limit.
+#
+# Same two ACME flows as every other playbook in this collection (see
+# roles_reference/nginx_deploy/main.yml's header and
+# docs/design/acme-playbook-variables.md for the full contract), with one
+# important difference: the certificate is issued on the Ansible control
+# node itself (there is no BIG-IP shell to run acme.sh on), so acme_flow:
+# private's HTTP-01 challenge can only be answered if the CONTROL NODE --
+# not the BIG-IP virtual server -- is reachable at common_name:80, which is
+# almost never true for a BIG-IP-fronted domain. In practice, use acme_flow:
+# public (DNS-01) for F5 targets; acme_flow: private only works here if
+# you've separately arranged for the challenge to reach the control node,
+# which this playbook does not set up for you.
+#
+# Renews and installs one certificate on one BIG-IP virtual server /
+# client-SSL profile per run:
+#   bigip_host / bigip_port      (required) BIG-IP management IP/FQDN and API port
+#   bigip_user / bigip_password  (required) BIG-IP admin credentials
+#   bigip_validate_certs         default true; set false only for a lab BIG-IP
+#                                 with a self-signed management cert
+#   partition                    BIG-IP partition, default "Common"
+#   common_name                  (required) CN to request/install
+#   subject_alt_names            defaults to []
+#   ssl_cert_name                 BIG-IP object name for the uploaded cert/key
+#                                 pair; defaults to common_name
+#   client_ssl_profile_name      client-SSL profile to create/update with the
+#                                 new cert/key; defaults to
+#                                 "<ssl_cert_name>-clientssl"
+#   virtual_server_name          optional -- attach client_ssl_profile_name to
+#                                 this virtual server's clientSSL profile list
+#                                 if it isn't already there. Leave unset if
+#                                 the profile is already attached and this run
+#                                 is only rotating the cert/key it points at.
+#   verify_host / verify_port     optional post-deploy TLS probe target
+#                                 (defaults to common_name / 443); set
+#                                 verify_port to "" to skip verification
+#
+# Renewing several BIG-IP virtual servers / client-SSL profiles (whether on
+# one device or several) in a single job run: use f5_multi_deploy instead,
+# which takes a list of these same fields as `deploy_targets`.
+#
+# This file (roles_reference/f5_deploy/main.yml) is the untouched, shipped
+# baseline -- replaced wholesale by every CertSecure release. A manual/
+# emergency override goes in roles/f5_deploy/main.yml instead (empty by
+# default, not preserved across an upgrade); an edit saved via
+# PUT /aapIntegration/playbooks/files/f5_deploy is stored in MongoDB and
+# survives upgrades. Both take precedence over this file -- see
+# roles/README.md for the full three-tier resolution order.
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    f5_cert_staging_dir: "/etc/certsecure/acme/f5-staging/{{ common_name }}"
+    acme_cert_file: "{{ f5_cert_staging_dir }}/cert.pem"
+    acme_key_file: "{{ f5_cert_staging_dir }}/key.pem"
+    acme_fullchain_file: "{{ f5_cert_staging_dir }}/fullchain.pem"
+    acme_ca_file: "{{ f5_cert_staging_dir }}/chain.pem"
+    acme_reload_cmd: "true"    # nothing to reload on the control node -- the BIG-IP is updated below instead
+    bigip_port: 443
+    bigip_validate_certs: true
+    partition: "Common"
+    ssl_cert_name: "{{ common_name }}"
+    client_ssl_profile_name: "{{ ssl_cert_name }}-clientssl"
+    verify_port: 443
+    # bigip_host / bigip_user / bigip_password: no default on purpose --
+    # always pass via extraVars/host_vars. virtual_server_name: no default --
+    # leave unset if the profile is already attached to its virtual server.
+
+  tasks:
+    - name: Assert required BIG-IP connection variables are set
+      assert:
+        that:
+          - bigip_host is defined and bigip_host | length > 0
+          - bigip_user is defined and bigip_user | length > 0
+          - bigip_password is defined and bigip_password | length > 0
+        fail_msg: "bigip_host, bigip_user and bigip_password must all be supplied via extraVars/host_vars."
+      no_log: false
+
+    - name: Resolve the BIG-IP iControl REST provider
+      set_fact:
+        _f5_provider:
+          server: "{{ bigip_host }}"
+          server_port: "{{ bigip_port }}"
+          user: "{{ bigip_user }}"
+          password: "{{ bigip_password }}"
+          validate_certs: "{{ bigip_validate_certs }}"
+      no_log: false
+
+    - name: Issue/renew the certificate on the control node
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Read back the issued private key so it can be uploaded to the BIG-IP
+      slurp:
+        src: "{{ acme_key_file }}"
+      register: _f5_key_slurp
+      no_log: false
+
+    - name: Read back the issued fullchain so it can be uploaded to the BIG-IP
+      slurp:
+        src: "{{ acme_fullchain_file }}"
+      register: _f5_chain_slurp
+
+    - name: Upload the private key to the BIG-IP
+      f5networks.f5_modules.bigip_ssl_key:
+        provider: "{{ _f5_provider }}"
+        name: "{{ ssl_cert_name }}"
+        partition: "{{ partition }}"
+        content: "{{ _f5_key_slurp.content | b64decode }}"
+        state: present
+      no_log: false
+
+    - name: Upload the certificate (fullchain) to the BIG-IP
+      f5networks.f5_modules.bigip_ssl_certificate:
+        provider: "{{ _f5_provider }}"
+        name: "{{ ssl_cert_name }}"
+        partition: "{{ partition }}"
+        content: "{{ _f5_chain_slurp.content | b64decode }}"
+        state: present
+
+    - name: Create/update the client-SSL profile to use the uploaded cert/key
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        provider: "{{ _f5_provider }}"
+        name: "{{ client_ssl_profile_name }}"
+        partition: "{{ partition }}"
+        cert_key_chain:
+          - cert: "{{ ssl_cert_name }}"
+            key: "{{ ssl_cert_name }}"
+        state: present
+
+    - name: Attach the client-SSL profile to the virtual server
+      f5networks.f5_modules.bigip_virtual_server:
+        provider: "{{ _f5_provider }}"
+        name: "{{ virtual_server_name }}"
+        partition: "{{ partition }}"
+        profiles:
+          - name: "{{ client_ssl_profile_name }}"
+            context: clientside
+      when: virtual_server_name is defined and virtual_server_name | length > 0
+
+    - name: Remove the staged certificate material from the control node
+      file:
+        path: "{{ f5_cert_staging_dir }}"
+        state: absent
+
+    - name: Verify the BIG-IP virtual server is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect
+        {{ verify_host | default(common_name) }}:{{ verify_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+      when: (verify_port | string) | length > 0
+
+    - name: Report verification result
+      debug:
+        msg: >-
+          {{ _verify_result.stdout | default('Could not verify -- check verify_host/verify_port/common_name.')
+             if _verify_result is defined else 'Verification skipped (verify_port set to "").' }}

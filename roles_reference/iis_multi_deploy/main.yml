@@ -1,0 +1,201 @@
+---
+# CertSecure ACME renewal playbook -- IIS, explicit multi-server
+#
+# Same model as roles_reference/nginx_multi_deploy/main.yml (see that file's
+# header for the full rationale and the general `deploy_targets` idea) and
+# the same Posh-ACME/IIS-binding approach as roles_reference/iis_deploy/main.yml
+# (see that file's header and docs/design/acme-playbook-variables.md for the
+# full contract). Use this instead of iis_deploy when you want ONE job run to
+# renew certs across many IIS servers AAP doesn't (or shouldn't need to) know
+# about as Inventory hosts -- see nginx_multi_deploy/main.yml's header for
+# why CertSecure's own batch launch mode isn't a substitute for this. Launch
+# the Job Template against any placeholder inventory (e.g. "localhost", local
+# connection) -- the real targets travel entirely inside extraVars as
+# `deploy_targets`.
+#
+# Since these hosts are never in AAP Inventory, WinRM connection vars must
+# also travel per-target (or via the shared winrm_* defaults below) -- an
+# inventory group_vars/windows.yml with ansible_connection: winrm is not in
+# play here.
+#
+# `deploy_targets` is a list of objects, one per IIS server:
+#   host                          (required) dynamic inventory name, and the
+#                                 default for ansible_host/common_name below
+#   ansible_host                  actual IP/FQDN to connect to, if different
+#                                 from `host`
+#   ansible_user / ansible_password / ansible_port
+#                                 per-server WinRM connection overrides --
+#                                 since these hosts are never in AAP
+#                                 Inventory, connection details must come
+#                                 from here (falls back to the shared
+#                                 winrm_user/winrm_password/winrm_port below
+#                                 when omitted)
+#   ansible_winrm_transport / ansible_winrm_server_cert_validation
+#                                 per-server WinRM transport overrides,
+#                                 falling back to the shared
+#                                 winrm_transport/winrm_server_cert_validation
+#                                 below
+#   common_name                   defaults to `host`
+#   subject_alt_names             defaults to []
+#   acme_pfx_password / iis_site_name / iis_binding_ip / iis_binding_port
+#                                 same meaning as iis_deploy's own variables
+#                                 (see this directory's argument_spec.yml) --
+#                                 per-server override, falls back to this
+#                                 playbook's own defaults below when omitted.
+#                                 acme_pfx_password falls back to the shared
+#                                 acme_pfx_password (if any) below.
+#
+# Everything else (acme_flow, acme_account_email, the private/public flow
+# variables, enrollment variables) is shared across the whole run -- set once
+# via vars_files/extraVars, same as every other playbook in this collection.
+#
+# This file (roles_reference/iis_multi_deploy/main.yml) is the untouched,
+# shipped baseline -- see roles/README.md for the full three-tier resolution
+# order (a disk override under roles/iis_multi_deploy/main.yml, or a
+# Mongo-saved edit from PUT /aapIntegration/playbooks/files/iis_multi_deploy,
+# both take precedence over this file).
+
+- name: Build a throwaway inventory from deploy_targets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    winrm_port: 5986
+    winrm_transport: ntlm
+    winrm_server_cert_validation: ignore
+    # winrm_user / winrm_password: no default on purpose -- supply per
+    # server in deploy_targets, or once here/via extraVars if every server
+    # shares one admin account.
+  tasks:
+    - name: Assert deploy_targets is a non-empty list
+      assert:
+        that:
+          - deploy_targets is defined
+          - deploy_targets | length > 0
+        fail_msg: >-
+          deploy_targets must be a non-empty list of {host, ...} objects --
+          see this playbook's header comment for the full per-server schema.
+
+    - name: Register each explicit server as a dynamic inventory host
+      add_host:
+        name: "{{ item.host }}"
+        groups: iis_multi_targets
+        ansible_host: "{{ item.ansible_host | default(item.host) }}"
+        ansible_connection: winrm
+        ansible_user: "{{ item.ansible_user | default(winrm_user | default(omit)) }}"
+        ansible_password: "{{ item.ansible_password | default(winrm_password | default(omit)) }}"
+        ansible_port: "{{ item.ansible_port | default(winrm_port) }}"
+        ansible_winrm_transport: "{{ item.ansible_winrm_transport | default(winrm_transport) }}"
+        ansible_winrm_server_cert_validation: "{{ item.ansible_winrm_server_cert_validation | default(winrm_server_cert_validation) }}"
+        _target_common_name: "{{ item.common_name | default(item.host) }}"
+        _target_subject_alt_names: "{{ item.subject_alt_names | default([]) }}"
+        _target_acme_pfx_password: "{{ item.acme_pfx_password | default(acme_pfx_password | default(omit)) }}"
+        _target_iis_site_name: "{{ item.iis_site_name | default(omit) }}"
+        _target_iis_binding_ip: "{{ item.iis_binding_ip | default(omit) }}"
+        _target_iis_binding_port: "{{ item.iis_binding_port | default(omit) }}"
+      loop: "{{ deploy_targets }}"
+      loop_control:
+        label: "{{ item.host }}"
+      no_log: false
+
+- name: Issue/renew and install the certificate on every explicit IIS server
+  hosts: iis_multi_targets
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    common_name: "{{ _target_common_name }}"
+    subject_alt_names: "{{ _target_subject_alt_names }}"
+    acme_pfx_password: "{{ _target_acme_pfx_password | default('') }}"
+    acme_pfx_dir: 'C:\CertSecure\acme\{{ common_name }}'
+    acme_pfx_file: '{{ acme_pfx_dir }}\{{ common_name }}.pfx'
+    iis_site_name: "{{ _target_iis_site_name | default('Default Web Site') }}"
+    iis_binding_ip: "{{ _target_iis_binding_ip | default('*') }}"
+    iis_binding_port: "{{ _target_iis_binding_port | default(443) }}"
+    acme_webroot_path: 'C:\inetpub\wwwroot'          # IIS's default docroot -- avoids Posh-ACME's WebSelfHost
+                                                       # standalone HTTP-01 listener colliding with IIS already
+                                                       # holding :80. Override per target if the site's physical
+                                                       # path differs.
+    verify_port: "{{ iis_binding_port }}"
+
+  tasks:
+    - name: Assert the PFX password is set
+      assert:
+        that:
+          - acme_pfx_password is defined and acme_pfx_password | length > 0
+        fail_msg: >-
+          acme_pfx_password must be supplied per server in deploy_targets (or
+          once as the shared acme_pfx_password extraVar).
+      no_log: false
+
+    - name: Issue/renew the certificate for IIS
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_windows.yml"
+
+    # Posh-ACME's New-PACertificate -PfxPass does not reliably honor the
+    # password passed to it (observed: the exported PFX ends up encrypted
+    # with the literal text "System.Security.SecureString" -- the .ToString()
+    # of a SecureString object -- regardless of the real value supplied).
+    # Get-PACertificate's own PfxPass property always reflects whatever
+    # password Posh-ACME actually used, so read it back and use that for the
+    # import instead of trusting acme_pfx_password made it into the file.
+    - name: Read back the password Posh-ACME actually encrypted the PFX with
+      ansible.windows.win_shell: |
+        Import-Module Posh-ACME
+        $cert = Get-PACertificate -MainDomain "{{ common_name }}"
+        $cred = New-Object System.Management.Automation.PSCredential("x", $cert.PfxPass)
+        Write-Output $cred.GetNetworkCredential().Password
+      register: _actual_pfx_password
+      changed_when: false
+      no_log: false
+
+    - name: Import the PFX into the local machine Personal certificate store
+      ansible.windows.win_certificate_store:
+        path: "{{ acme_pfx_file }}"
+        password: "{{ _actual_pfx_password.stdout | trim }}"
+        key_exportable: false
+        key_storage: machine
+        store_location: LocalMachine
+        store_name: My
+        state: present
+      register: _iis_cert_import
+      no_log: false
+
+    - name: Ensure the IIS Web-Server feature's PowerShell module is available
+      ansible.windows.win_shell: Import-Module WebAdministration
+      changed_when: false
+
+    - name: Bind the renewed certificate to the site (creates the binding if missing)
+      ansible.windows.win_shell: |
+        Import-Module WebAdministration
+        $thumbprint = "{{ _iis_cert_import.thumbprints[0] }}"
+        $binding = Get-WebBinding -Name "{{ iis_site_name }}" -Protocol https -Port {{ iis_binding_port }} -ErrorAction SilentlyContinue
+        if (-not $binding) {
+          New-WebBinding -Name "{{ iis_site_name }}" -Protocol https -Port {{ iis_binding_port }} -IPAddress "{{ iis_binding_ip }}" -SslFlags 0
+          $binding = Get-WebBinding -Name "{{ iis_site_name }}" -Protocol https -Port {{ iis_binding_port }}
+        }
+        $binding.AddSslCertificate($thumbprint, "my")
+      changed_when: true
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify IIS is serving the new certificate
+      ansible.windows.win_shell: |
+        $req = [System.Net.HttpWebRequest]::Create("https://127.0.0.1:{{ verify_port }}/")
+        $req.ServerCertificateValidationCallback = { $true }
+        try {
+          $resp = $req.GetResponse()
+          $cert = $req.ServicePoint.Certificate
+          Write-Output $cert.GetExpirationDateString()
+          $resp.Close()
+        } catch {
+          Write-Output "Could not verify: $($_.Exception.Message)"
+        }
+      register: _verify_result
+      changed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | trim }}"

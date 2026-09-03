@@ -1,0 +1,71 @@
+---
+# Variable contract for custom_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). Covers both the Linux and
+# Windows branches (chosen automatically from ansible_os_family). Internal
+# derived variables (custom_work_dir, acme_cert_file/key_file/fullchain_file/
+# ca_file, acme_pfx_dir, acme_pfx_file) are deliberately not listed here.
+# Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: custom_file_owner
+    type: str
+    required: false
+    default: "root"
+    secret: false
+    description: 'Linux only: owner set on the installed certificate material.'
+    choices: null
+
+  - name: custom_file_group
+    type: str
+    required: false
+    default: "root"
+    secret: false
+    description: 'Linux only: group set on the installed certificate material.'
+    choices: null
+
+  - name: custom_file_mode
+    type: str
+    required: false
+    default: "0640"
+    secret: false
+    description: 'Linux only: file mode set on the installed certificate material.'
+    choices: null
+
+  - name: custom_pre_install_command
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: Optional shell (Linux) or PowerShell (Windows) run before the certificate material is in place.
+    choices: null
+
+  - name: custom_post_install_command
+    type: str
+    required: true
+    default: null
+    secret: false
+    description: >-
+      Your app's "reload/restart the service" step -- the playbook asserts
+      this is set (to something non-empty) before it will run, so it is a
+      genuinely required variable, not optional.
+    choices: null
+
+  - name: custom_verify_command
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: Optional, run at the end to confirm the new certificate is actually live.
+    choices: null
+
+  - name: acme_pfx_password
+    type: str
+    required: true
+    default: null
+    secret: true
+    description: >-
+      Windows only. Protects the issued PFX at rest. No default -- always
+      supply via extraVars/host_vars.
+    choices: null

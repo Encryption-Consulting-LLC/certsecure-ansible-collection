@@ -1,0 +1,116 @@
+---
+# CertSecure ACME renewal playbook -- Oracle Database (listener TLS)
+#
+# Same two flows as roles/nginx_deploy/main.yml (see that file's header and
+# docs/design/acme-playbook-variables.md for the full contract). Oracle's
+# listener reads TLS material from an Oracle Wallet, not raw PEM files, so
+# this playbook builds a PKCS12 bundle from the renewed cert/key/chain and
+# imports it into the wallet with orapki, then reloads the listener.
+#
+# This file (roles_reference/oracle_deploy/main.yml) is the untouched,
+# shipped baseline -- see roles/README.md for the full three-tier resolution
+# order (a disk override under roles/oracle_deploy/main.yml, or a
+# Mongo-saved edit from PUT /aapIntegration/playbooks/files/oracle_deploy,
+# both take precedence over this file).
+
+- hosts: all
+  become: true
+  become_user: "{{ oracle_os_user | default('oracle') }}"
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    oracle_work_dir: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}/certsecure/{{ common_name }}"
+    acme_cert_file: "{{ oracle_work_dir }}/cert.pem"
+    acme_key_file: "{{ oracle_work_dir }}/key.pem"
+    acme_fullchain_file: "{{ oracle_work_dir }}/fullchain.pem"
+    acme_ca_file: "{{ oracle_work_dir }}/chain.pem"
+    oracle_wallet_path: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}/wallet"
+    # oracle_wallet_password: no default on purpose -- always pass this via
+    # extraVars/host_vars, never commit a real password into this file.
+    oracle_listener_name: "LISTENER"
+    # Run under the oracle OS user's own writable paths (become_user: oracle
+    # above), not the collection-wide /opt/acme.sh default, which oracle
+    # typically can't write to. This addresses acme.sh's own working
+    # directory only -- it does NOT address Ansible's separate become_user
+    # caveat (module execution needs a remote temp dir the become_user can
+    # read, which needs POSIX ACL support on the target filesystem -- see
+    # docs/design/acme-playbook-variables.md's Oracle entry and
+    # https://docs.ansible.com/ansible-core/2.16/playbook_guide/playbooks_privilege_escalation.html#risks-of-becoming-an-unprivileged-user).
+    # If become_user: oracle fails with a permission error copying/executing
+    # a module, set ansible_remote_tmp (inventory/host_vars) to a path oracle
+    # can access, per that doc -- this collection doesn't set one itself
+    # since the right path is host-specific.
+    acme_sh_install_dir: "{{ oracle_work_dir }}/acme.sh-install"
+    acme_sh_home: "{{ oracle_work_dir }}/acme.sh-home"
+    reload_command: "lsnrctl reload {{ oracle_listener_name }}"
+    preflight_validation_command: ""
+    verify_port: 2484
+
+  tasks:
+    - name: Assert the wallet password is set
+      assert:
+        that:
+          - oracle_wallet_password is defined and oracle_wallet_password | length > 0
+        fail_msg: "oracle_wallet_password must be supplied via extraVars/host_vars (never committed to this file)."
+      no_log: false
+
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      when: preflight_validation_command | length > 0
+      changed_when: false
+
+    - name: Issue/renew the certificate to the Oracle work directory
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+      vars:
+        acme_reload_cmd: "true"   # the real listener reload happens below, after the wallet import
+
+    - name: Build the PKCS12 bundle from the renewed certificate
+      command: >-
+        openssl pkcs12 -export
+        -in {{ acme_fullchain_file }}
+        -inkey {{ acme_key_file }}
+        -name {{ common_name }}
+        -out {{ oracle_work_dir }}/bundle.p12
+        -passout env:ORACLE_WALLET_PW
+      environment:
+        ORACLE_WALLET_PW: "{{ oracle_wallet_password }}"
+      no_log: false
+      changed_when: true
+
+    - name: Ensure the Oracle Wallet exists (creates it if this is the first run)
+      command: >-
+        orapki wallet create -wallet {{ oracle_wallet_path }}
+        -pwd {{ oracle_wallet_password }} -auto_login_only
+      args:
+        creates: "{{ oracle_wallet_path }}/cwallet.sso"
+      no_log: false
+
+    - name: Import the renewed certificate into the Oracle Wallet
+      command: >-
+        orapki wallet import_pkcs12 -wallet {{ oracle_wallet_path }}
+        -pwd {{ oracle_wallet_password }}
+        -pkcs12file {{ oracle_work_dir }}/bundle.p12
+        -pkcs12pwd {{ oracle_wallet_password }}
+      no_log: false
+      changed_when: true
+
+    - name: Reload the listener to pick up the new wallet contents
+      command: "{{ reload_command }}"
+      changed_when: true
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify the listener is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ verify_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check verify_port/common_name.') }}"

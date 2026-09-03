@@ -1,0 +1,90 @@
+---
+# Variable contract for tomcat_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). Internal derived variables
+# (tomcat_work_dir, acme_cert_file/key_file/fullchain_file/ca_file) are
+# deliberately not listed here.
+# Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: reload_command
+    type: str
+    required: false
+    default: "systemctl restart tomcat"
+    secret: false
+    description: >-
+      Tomcat loads the keystore at JVM start -- a plain reload can't pick up
+      a rotated keystore, so this defaults to a full restart.
+    choices: null
+
+  - name: preflight_validation_command
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: >-
+      No standard Tomcat config-test equivalent; leave blank or point at
+      your own.
+    choices: null
+
+  - name: tomcat_keystore_path
+    type: str
+    required: false
+    default: "/etc/tomcat/ssl/{{ common_name }}.p12"
+    secret: false
+    description: >-
+      Stable path the keystore is rebuilt at every run -- point your
+      Connector's keystoreFile at this path once.
+    choices: null
+
+  - name: tomcat_keystore_alias
+    type: str
+    required: false
+    default: "{{ common_name }}"
+    secret: false
+    description: Alias the certificate is stored under in the keystore.
+    choices: null
+
+  - name: tomcat_keystore_password
+    type: str
+    required: true
+    default: null
+    secret: true
+    description: >-
+      Always pass via extraVars/host_vars, never commit a real password to
+      this file. Kept stable across renewals so the Connector's config never
+      needs to change.
+    choices: null
+
+  - name: tomcat_keystore_owner
+    type: str
+    required: false
+    default: "tomcat"
+    secret: false
+    description: Owner set on the rebuilt keystore file.
+    choices: null
+
+  - name: tomcat_keystore_group
+    type: str
+    required: false
+    default: "tomcat"
+    secret: false
+    description: Group set on the rebuilt keystore file.
+    choices: null
+
+  - name: tomcat_keystore_mode
+    type: str
+    required: false
+    default: "0640"
+    secret: false
+    description: File mode set on the rebuilt keystore file.
+    choices: null
+
+  - name: verify_port
+    type: int
+    required: false
+    default: 8443
+    secret: false
+    description: Port to TLS-probe for the post-deploy verification check.
+    choices: null

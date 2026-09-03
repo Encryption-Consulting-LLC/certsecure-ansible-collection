@@ -1,0 +1,308 @@
+---
+# Variable contract shared by every CertSecure ACME certificate-renewal
+# playbook -- surfaced by GET /aapIntegration/playbooks/files (and the
+# single-playbook GET) so the frontend's Create Job Template / Launch Job
+# dialogs can pre-fill extraVars the moment a playbook is selected, instead
+# of the user guessing variable names by hand.
+#
+# This is CertSecure's OWN format, parsed and merged by
+# classes/functions/automation_platform.py -- it is not consumed by Ansible
+# itself (there is no meta/argument_specs.yml anywhere in this collection;
+# these are plain playbooks, not roles). Never shipped to AAP: excluded from
+# both the playbook-alias list and build_playbooks_archive()'s tarball.
+#
+# Covers the "Common to every playbook", "Private flow", "Public flow", and
+# "Enrolling a publicly-issued certificate back into CertSecure" sections of
+# docs/design/acme-playbook-variables.md -- that doc remains the prose
+# source of truth; keep the two in sync when either changes. Each family
+# playbook's own argument_spec.yml (e.g. roles_reference/nginx_deploy/
+# argument_spec.yml) layers its app-specific variables on top of this file,
+# winning on a name collision (see oracle_deploy/argument_spec.yml's
+# acme_sh_install_dir/acme_sh_home override).
+#
+# Purely additive to the family vars: blocks / _acme_lib/vars/defaults.yml --
+# this file does not set any Ansible variable itself, it only documents the
+# ones defaults.yml and the shared _acme_lib/tasks/*.yml already consume.
+
+variables:
+  # --- certificate request -------------------------------------------------
+  - name: common_name
+    type: str
+    required: true
+    default: null
+    secret: false
+    description: >-
+      Primary domain/CN to request. Varies per host -- pass via extraVars or
+      the batch launch's per-host `variables`.
+    choices: null
+
+  - name: subject_alt_names
+    type: list
+    required: false
+    default: []
+    secret: false
+    description: Extra SANs beyond common_name.
+    choices: null
+
+  - name: acme_flow
+    type: str
+    required: false
+    default: "private"
+    secret: false
+    description: >-
+      private = CertSecure's own ACME server (HTTP-01, EAB). public = a
+      public CA's ACME server directly (DNS-01), followed by enroll-back.
+    choices: ["private", "public"]
+
+  - name: key_type
+    type: str
+    required: false
+    default: "rsa"
+    secret: false
+    description: ecdsa uses the P-256 curve.
+    choices: ["rsa", "ecdsa"]
+
+  - name: key_size
+    type: int
+    required: false
+    default: 2048
+    secret: false
+    description: RSA key size (ignored when key_type is ecdsa).
+    choices: null
+
+  - name: acme_account_email
+    type: str
+    required: true
+    default: null
+    secret: false
+    description: >-
+      Contact email registered with the ACME account. Must be a real domain --
+      CertSecure's own ACME server rejects non-routable placeholders like
+      "automation@localhost".
+    choices: null
+
+  # --- private flow: CertSecure's own ACME server ---------------------------
+  - name: certsecure_base_url
+    type: str
+    required: false
+    default: "https://REPLACE_WITH_CERTSECURE_BACKEND_URL"
+    secret: false
+    description: >-
+      CertSecure's own backend URL (conf.ini [ENVIRONMENT].backend). Same for
+      every host against one CertSecure instance -- set once in
+      group_vars/all.yml or have CertSecure inject it at launch. The shipped
+      placeholder fails loudly if left unset (private flow only).
+    choices: null
+
+  - name: certsecure_acme_directory_url
+    type: str
+    required: false
+    default: "{{ certsecure_base_url }}/v2/acme"
+    secret: false
+    description: Rarely overridden directly.
+    choices: null
+
+  - name: certsecure_eab_kid
+    type: str
+    required: true
+    default: null
+    secret: true
+    description: >-
+      From a CertSecure.ACME.Users profile (POST /acme/generate_profile).
+      Required for the private flow.
+    choices: null
+
+  - name: certsecure_eab_hmac
+    type: str
+    required: true
+    default: null
+    secret: true
+    description: >-
+      EAB HMAC from a CertSecure.ACME.Users profile. Required for the
+      private flow.
+    choices: null
+
+  - name: acme_webroot_path
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: >-
+      Set to an existing webroot (e.g. the app's own docroot) if port 80 is
+      already bound by the app itself and acme.sh's --standalone listener
+      would conflict. Blank uses a temporary standalone listener on port 80.
+    choices: null
+
+  - name: certsecure_validate_certs
+    type: bool
+    required: false
+    default: true
+    secret: false
+    description: Set false only against a self-signed/lab CertSecure instance.
+    choices: null
+
+  # --- public flow: direct to a public CA -----------------------------------
+  - name: public_ca_directory_url
+    type: str
+    required: false
+    default: "https://acme-v02.api.letsencrypt.org/directory"
+    secret: false
+    description: >-
+      From a CertSecure.ACME.URL entry's url field. Differs per public CA,
+      same for every host using that CA.
+    choices: null
+
+  - name: public_ca_eab_kid
+    type: str
+    required: false
+    default: null
+    secret: true
+    description: >-
+      Only some public CAs require EAB (e.g. Google Trust Services); leave
+      unset for ones that don't (e.g. Let's Encrypt) -- both issue_linux.yml
+      and issue_windows.yml guard this with a `| default('') | length > 0`
+      check, so it is genuinely optional. From the same CertSecure.ACME.URL
+      entry.
+    choices: null
+
+  - name: public_ca_eab_hmac
+    type: str
+    required: false
+    default: null
+    secret: true
+    description: Paired with public_ca_eab_kid -- see its description.
+    choices: null
+
+  - name: dns_provider
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: >-
+      A key in _acme_lib/vars/dns_provider_map.yml (e.g. cloudflare), or
+      already the correct acme.sh/Posh-ACME identifier. From a
+      CertSecure.ACME.Domains entry's provider field.
+    choices: null
+
+  - name: dns_provider_credentials
+    type: dict
+    required: false
+    default: {}
+    secret: true
+    description: >-
+      Passed straight through as environment variables to acme.sh (Linux) or
+      a PluginArgs hashtable to Posh-ACME (Windows) -- the dict's keys must
+      exactly match what that provider's plugin expects on that OS. From the
+      matching CertSecure.ACME.Domains entry's credentials field. The
+      cloudflare-shaped example below is a seed group for the extra-vars
+      editor, not an enforced schema -- every provider's key names differ.
+    choices: null
+    options:
+      - name: CF_Token
+        type: str
+        required: false
+        default: null
+        secret: true
+        description: >-
+          Cloudflare API token (acme.sh dns_cf plugin / Posh-ACME's CFToken).
+          Only meaningful when dns_provider is cloudflare.
+        choices: null
+      - name: CF_Account_ID
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: Cloudflare account ID, required by some dns_cf configurations.
+        choices: null
+
+  - name: dns_propagation_wait
+    type: int
+    required: false
+    default: 120
+    secret: false
+    description: >-
+      Seconds to wait after publishing DNS records before validating. Raise
+      it if validation keeps failing on the DNS lookup rather than the CA
+      rejecting the request.
+    choices: null
+
+  # --- enrolling a publicly-issued cert back into CertSecure ----------------
+  - name: enroll_into_certsecure
+    type: bool
+    required: false
+    default: true
+    secret: false
+    description: >-
+      Set false to skip the enroll-acme-ca-cert call entirely (public flow
+      only).
+    choices: null
+
+  - name: enroll_url_id
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: >-
+      The CertSecure.ACME.URL entry this certificate was issued through --
+      required when enroll_into_certsecure is true.
+    choices: null
+
+  - name: enroll_domain_id
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: >-
+      Optional -- the CertSecure.ACME.Domains entry used for DNS-01
+      validation, kept on the record's other field for reference.
+    choices: null
+
+  - name: certsecure_api_token
+    type: str
+    required: false
+    default: null
+    secret: true
+    description: >-
+      A CertSecure bearer token with the 'Import Certificate' permission.
+      Only needed for the public flow's enroll-back step, and even then only
+      if enroll_into_certsecure is true (its default) -- set
+      enroll_into_certsecure: false to skip that step and this token
+      entirely. Irrelevant to the private flow (kid/hmac EAB against
+      CertSecure's own ACME server): that flow is already recorded in
+      Inventory by CertSecure's ACME server as part of issuance, so no token
+      is ever needed there. enroll_public_ca.yml still asserts this is set
+      whenever enroll_into_certsecure is true, regardless of this flag.
+    choices: null
+
+  - name: enroll_watchers
+    type: list
+    required: false
+    default: []
+    secret: false
+    description: Watcher list attached to the enrolled Inventory record.
+    choices: null
+
+  - name: enroll_tags
+    type: list
+    required: false
+    default: []
+    secret: false
+    description: Tags attached to the enrolled Inventory record.
+    choices: null
+
+  # --- acme.sh install location (Linux targets) -----------------------------
+  - name: acme_sh_install_dir
+    type: str
+    required: false
+    default: "/opt/acme.sh"
+    secret: false
+    description: Where acme.sh itself is installed on the target.
+    choices: null
+
+  - name: acme_sh_home
+    type: str
+    required: false
+    default: "/etc/certsecure/acme"
+    secret: false
+    description: acme.sh's --config-home (account/certificate state).
+    choices: null

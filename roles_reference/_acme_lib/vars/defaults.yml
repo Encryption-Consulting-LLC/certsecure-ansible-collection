@@ -1,0 +1,71 @@
+---
+# Shared default variables for every CertSecure ACME certificate-renewal
+# playbook under roles/. Values here are safe generic defaults -- override
+# any of them per host/group in AAP inventory (host_vars/group_vars), or per
+# job/schedule via extraVars (see docs/design/acme-playbook-variables.md for
+# the full contract and CertSecure's POST /jobs/launch "hosts[].variables"
+# batch mode for per-host overrides at launch time).
+#
+# This file is the LIVE, user-editable copy. roles_reference/_acme_lib/vars/
+# holds an untouched original of the same file to diff/revert against.
+
+# --- flow selection ----------------------------------------------------
+# "private" -> CertSecure's own ACME server (HTTP-01, EAB kid5/hmac from the
+#              CertSecure.ACME.Users profile) -- CertSecure issues the cert,
+#              so no separate enroll-back step is needed (see concepts note
+#              in the family playbooks).
+# "public"  -> a public CA's own ACME server, called directly (DNS-01, that
+#              CA's own EAB if it requires one, from CertSecure.ACME.URL),
+#              followed by an explicit enroll-back step so CertSecure still
+#              knows about the certificate (see enroll_public_ca.yml).
+acme_flow: "private"
+
+# --- certificate request -------------------------------------------------
+subject_alt_names: []              # extra SANs beyond common_name
+key_type: "rsa"                    # "rsa" | "ecdsa"
+key_size: 2048                     # RSA key size (ignored when key_type is ecdsa)
+# acme_account_email: no default on purpose -- always pass via extraVars/
+# host_vars. CertSecure's own ACME server rejects non-routable placeholders
+# like "automation@localhost", so a missing value should fail loudly here
+# rather than silently reaching the ACME server and being rejected deep
+# inside a no_log'd task.
+
+# --- private flow: CertSecure's own ACME server ---------------------------
+# certsecure_base_url should be supplied by CertSecure at launch time (it
+# already knows its own conf.ini [ENVIRONMENT].backend) -- the placeholder
+# below is intentionally not a real host so a misconfigured job fails loudly
+# instead of silently calling nowhere.
+certsecure_base_url: "https://REPLACE_WITH_CERTSECURE_BACKEND_URL"
+certsecure_acme_directory_url: "{{ certsecure_base_url }}/v2/acme"
+certsecure_validate_certs: true    # set false only for self-signed/lab CertSecure instances
+acme_webroot_path: ""              # existing HTTP-01 webroot to drop the challenge file in; blank = use a temporary standalone listener on port 80
+# certsecure_eab_kid / certsecure_eab_hmac: no default on purpose -- required
+# for the private flow, sourced from a CertSecure.ACME.Users profile
+# (POST /acme/generate_profile). Always pass these via extraVars/AAP
+# Credential injection, never commit them into this file.
+
+# --- public flow: direct to a public CA -----------------------------------
+public_ca_directory_url: "https://acme-v02.api.letsencrypt.org/directory"
+dns_provider: ""                   # a key from dns_provider_map.yml (or an already-correct plugin name), e.g. "cloudflare"
+dns_provider_credentials: {}       # provider-specific secrets -- see docs/design/acme-playbook-variables.md
+dns_propagation_wait: 120          # seconds to wait after publishing DNS records before validating
+# public_ca_eab_kid / public_ca_eab_hmac: no default -- only some public CAs
+# (e.g. Google Trust Services) require EAB; leave unset for CAs that don't
+# (e.g. Let's Encrypt).
+
+# --- enrolling a publicly-issued cert back into CertSecure ----------------
+# Registers the certificate as a normal CA-issued certificate (same shape
+# Generate Cert/Enroll CSR produce -- CertificateAuthority set to the ACME
+# URL's own registered CA name, thirdPartyCert left False), NOT as a
+# third-party import.
+enroll_into_certsecure: true         # set false to skip the enroll-acme-ca-cert call entirely (public flow only)
+enroll_url_id: ""                    # the CertSecure.ACME.URL entry this was issued through -- required when enroll_into_certsecure is true
+enroll_domain_id: ""                 # optional -- the CertSecure.ACME.Domains entry used for DNS-01 validation, kept for reference on the enrollment record
+enroll_watchers: []
+enroll_tags: []
+# certsecure_api_token: no default -- a CertSecure API/bearer token with the
+# 'Import Certificate' permission, required when enroll_into_certsecure is true.
+
+# --- acme.sh install location (Linux targets) -----------------------------
+acme_sh_install_dir: "/opt/acme.sh"
+acme_sh_home: "/etc/certsecure/acme"

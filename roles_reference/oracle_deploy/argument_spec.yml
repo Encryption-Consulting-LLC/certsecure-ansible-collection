@@ -1,0 +1,91 @@
+---
+# Variable contract for oracle_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). Note acme_sh_install_dir /
+# acme_sh_home below deliberately override the shared spec's entries of the
+# same name -- oracle_deploy runs acme.sh under the oracle OS user's own
+# writable paths instead of the collection-wide /opt/acme.sh default, which
+# oracle typically can't write to. Internal derived variables (oracle_work_dir,
+# acme_cert_file/key_file/fullchain_file/ca_file) are deliberately not listed
+# here. Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: oracle_home
+    type: str
+    required: false
+    default: "/u01/app/oracle/product/19.0.0/dbhome_1"
+    secret: false
+    description: Oracle home directory; also the base for the wallet/work-dir defaults below.
+    choices: null
+
+  - name: oracle_os_user
+    type: str
+    required: false
+    default: "oracle"
+    secret: false
+    description: >-
+      OS user the playbook becomes to run acme.sh/orapki. Becoming this
+      unprivileged user on some filesystems needs POSIX ACL support in /tmp.
+    choices: null
+
+  - name: oracle_wallet_path
+    type: str
+    required: false
+    default: "{{ oracle_home }}/wallet"
+    secret: false
+    description: Path to the Oracle Wallet the renewed certificate is imported into.
+    choices: null
+
+  - name: oracle_wallet_password
+    type: str
+    required: true
+    default: null
+    secret: true
+    description: >-
+      Always pass via extraVars/host_vars, never commit a real password to
+      this file.
+    choices: null
+
+  - name: oracle_listener_name
+    type: str
+    required: false
+    default: "LISTENER"
+    secret: false
+    description: Listener reloaded after the wallet is updated.
+    choices: null
+
+  - name: acme_sh_install_dir
+    type: str
+    required: false
+    default: "{{ oracle_work_dir }}/acme.sh-install"
+    secret: false
+    description: >-
+      Overrides the shared default of /opt/acme.sh -- runs under the oracle
+      OS user's own writable paths instead, which oracle typically can't
+      write to.
+    choices: null
+
+  - name: acme_sh_home
+    type: str
+    required: false
+    default: "{{ oracle_work_dir }}/acme.sh-home"
+    secret: false
+    description: Overrides the shared default of /etc/certsecure/acme, for the same reason as acme_sh_install_dir above.
+    choices: null
+
+  - name: preflight_validation_command
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: Set to skip; no standard listener config-test equivalent.
+    choices: null
+
+  - name: verify_port
+    type: int
+    required: false
+    default: 2484
+    secret: false
+    description: Port to TLS-probe for the post-deploy verification check.
+    choices: null

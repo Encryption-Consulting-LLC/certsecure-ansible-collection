@@ -1,0 +1,89 @@
+---
+# CertSecure ACME renewal playbook -- MongoDB
+#
+# Same two flows as roles/nginx_deploy/main.yml (see that file's header and
+# docs/design/acme-playbook-variables.md for the full contract). MongoDB's
+# --tlsCertificateKeyFile wants the private key and certificate concatenated
+# into a single PEM, so this playbook builds that file after acme.sh issues
+# the renewed material, then either hot-rotates it with
+# db.rotateCertificates() (MongoDB 3.6+, no restart / no dropped
+# connections -- the default) or restarts mongod, per
+# mongodb_hot_rotate.
+#
+# This file (roles_reference/mongodb_deploy/main.yml) is the untouched,
+# shipped baseline -- see roles/README.md for the full three-tier resolution
+# order (a disk override under roles/mongodb_deploy/main.yml, or a
+# Mongo-saved edit from PUT /aapIntegration/playbooks/files/mongodb_deploy,
+# both take precedence over this file).
+
+- hosts: all
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    mongodb_ssl_dir: "/etc/mongodb/ssl/{{ common_name }}"
+    acme_cert_file: "{{ mongodb_ssl_dir }}/cert.pem"
+    acme_key_file: "{{ mongodb_ssl_dir }}/key.pem"
+    acme_fullchain_file: "{{ mongodb_ssl_dir }}/fullchain.pem"
+    acme_ca_file: "{{ mongodb_ssl_dir }}/chain.pem"
+    mongodb_pem_path: "{{ mongodb_ssl_dir }}/mongodb.pem"
+    mongodb_pem_owner: "mongodb"
+    mongodb_pem_group: "mongodb"
+    mongodb_pem_mode: "0600"
+    mongodb_hot_rotate: true
+    # Only used when mongodb_hot_rotate is true -- a full mongosh/mongo
+    # invocation using whatever auth mechanism this deployment actually uses
+    # (x.509, SCRAM, --host/--port, a replica-set connection string, ...).
+    mongodb_rotate_command: >-
+      mongosh --quiet --port {{ mongodb_port | default(27017) }}
+      --eval "db.rotateCertificates()"
+    reload_command: "systemctl restart mongod"   # used when mongodb_hot_rotate is false
+    preflight_validation_command: ""
+
+  tasks:
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      when: preflight_validation_command | length > 0
+      changed_when: false
+
+    - name: Issue/renew the certificate to the MongoDB TLS directory
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+      vars:
+        acme_reload_cmd: "true"   # the real rotate/restart happens below, after the combined PEM is built
+
+    - name: Build the combined key+certificate PEM MongoDB expects
+      assemble:
+        src: "{{ mongodb_ssl_dir }}"
+        regexp: '^(key|cert)\.pem$'
+        dest: "{{ mongodb_pem_path }}"
+        owner: "{{ mongodb_pem_owner }}"
+        group: "{{ mongodb_pem_group }}"
+        mode: "{{ mongodb_pem_mode }}"
+
+    - name: Hot-rotate the certificate (no restart)
+      command: "{{ mongodb_rotate_command }}"
+      when: mongodb_hot_rotate | bool
+      changed_when: true
+      no_log: falsee
+
+    - name: Restart mongod to pick up the new certificate
+      command: "{{ reload_command }}"
+      when: not (mongodb_hot_rotate | bool)
+      changed_when: true
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify MongoDB is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ mongodb_port | default(27017) }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check mongodb_port/common_name.') }}"

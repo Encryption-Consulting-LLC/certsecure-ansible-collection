@@ -1,0 +1,188 @@
+---
+# CertSecure ACME renewal playbook -- Tomcat, explicit multi-server
+#
+# Same model as roles_reference/nginx_multi_deploy/main.yml (see that file's
+# header for the full rationale and the shared `deploy_targets` schema) and
+# the same keystore-rebuild approach as roles_reference/tomcat_deploy/main.yml
+# (see that file's header and docs/design/acme-playbook-variables.md for the
+# full contract). Use this instead of tomcat_deploy when you want ONE job run
+# to renew certs across many Tomcat servers AAP doesn't (or shouldn't need
+# to) know about as Inventory hosts -- see nginx_multi_deploy/main.yml's
+# header for why CertSecure's own batch launch mode isn't a substitute for
+# this. Launch the Job Template against any placeholder inventory (e.g.
+# "localhost", local connection) -- the real targets travel entirely inside
+# extraVars as `deploy_targets`.
+#
+# `deploy_targets` is a list of objects, one per Tomcat server:
+#   host                          (required) dynamic inventory name, and the
+#                                 default for ansible_host/common_name below
+#   ansible_host                  actual IP/FQDN to connect to, if different
+#                                 from `host`
+#   ansible_user / ansible_port / ansible_ssh_private_key_file /
+#   ansible_password / ansible_become_password
+#                                 per-server connection overrides -- since
+#                                 these hosts are never in AAP Inventory,
+#                                 connection details must come from here
+#   common_name                   defaults to `host`
+#   subject_alt_names             defaults to []
+#   reload_command / preflight_validation_command / tomcat_keystore_path /
+#   tomcat_keystore_alias / tomcat_keystore_password / tomcat_keystore_owner /
+#   tomcat_keystore_group / tomcat_keystore_mode / verify_port
+#                                 same meaning as tomcat_deploy's own
+#                                 variables (see this directory's
+#                                 argument_spec.yml) -- per-server override,
+#                                 falls back to this playbook's own defaults
+#                                 below when omitted. tomcat_keystore_password
+#                                 has no fallback (required per server, same
+#                                 as the single-host playbook).
+#
+# Everything else (acme_flow, acme_account_email, the private/public flow
+# variables, enrollment variables) is shared across the whole run -- set once
+# via vars_files/extraVars, same as every other playbook in this collection.
+#
+# This file (roles_reference/tomcat_multi_deploy/main.yml) is the untouched,
+# shipped baseline -- see roles/README.md for the full three-tier resolution
+# order (a disk override under roles/tomcat_multi_deploy/main.yml, or a
+# Mongo-saved edit from PUT /aapIntegration/playbooks/files/tomcat_multi_deploy,
+# both take precedence over this file).
+
+- name: Build a throwaway inventory from deploy_targets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Assert deploy_targets is a non-empty list
+      assert:
+        that:
+          - deploy_targets is defined
+          - deploy_targets | length > 0
+        fail_msg: >-
+          deploy_targets must be a non-empty list of {host, ...} objects --
+          see this playbook's header comment for the full per-server schema.
+
+    - name: Register each explicit server as a dynamic inventory host
+      add_host:
+        name: "{{ item.host }}"
+        groups: tomcat_multi_targets
+        ansible_host: "{{ item.ansible_host | default(item.host) }}"
+        ansible_user: "{{ item.ansible_user | default(omit) }}"
+        ansible_port: "{{ item.ansible_port | default(omit) }}"
+        ansible_ssh_private_key_file: "{{ item.ansible_ssh_private_key_file | default(omit) }}"
+        ansible_password: "{{ item.ansible_password | default(omit) }}"
+        ansible_become_password: "{{ item.ansible_become_password | default(omit) }}"
+        _target_common_name: "{{ item.common_name | default(item.host) }}"
+        _target_subject_alt_names: "{{ item.subject_alt_names | default([]) }}"
+        _target_reload_command: "{{ item.reload_command | default(omit) }}"
+        _target_preflight_validation_command: "{{ item.preflight_validation_command | default(omit) }}"
+        _target_tomcat_keystore_path: "{{ item.tomcat_keystore_path | default(omit) }}"
+        _target_tomcat_keystore_alias: "{{ item.tomcat_keystore_alias | default(omit) }}"
+        _target_tomcat_keystore_password: "{{ item.tomcat_keystore_password | default(omit) }}"
+        _target_tomcat_keystore_owner: "{{ item.tomcat_keystore_owner | default(omit) }}"
+        _target_tomcat_keystore_group: "{{ item.tomcat_keystore_group | default(omit) }}"
+        _target_tomcat_keystore_mode: "{{ item.tomcat_keystore_mode | default(omit) }}"
+        _target_verify_port: "{{ item.verify_port | default(omit) }}"
+      loop: "{{ deploy_targets }}"
+      loop_control:
+        label: "{{ item.host }}"
+      no_log: false
+
+- name: Issue/renew and install the certificate on every explicit Tomcat server
+  hosts: tomcat_multi_targets
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    common_name: "{{ _target_common_name }}"
+    subject_alt_names: "{{ _target_subject_alt_names }}"
+    tomcat_work_dir: "/etc/tomcat/certsecure/{{ common_name }}"
+    acme_cert_file: "{{ tomcat_work_dir }}/cert.pem"
+    acme_key_file: "{{ tomcat_work_dir }}/key.pem"
+    acme_fullchain_file: "{{ tomcat_work_dir }}/fullchain.pem"
+    acme_ca_file: "{{ tomcat_work_dir }}/chain.pem"
+    acme_reload_cmd: "{{ reload_command }}"
+    # Tomcat loads the keystore at JVM start -- a plain reload can't pick up
+    # a rotated keystore, so the default reload_command is a full restart.
+    reload_command: "{{ _target_reload_command | default('systemctl restart tomcat') }}"
+    preflight_validation_command: "{{ _target_preflight_validation_command | default('') }}"
+    tomcat_keystore_path: "{{ _target_tomcat_keystore_path | default('/etc/tomcat/ssl/' ~ common_name ~ '.p12') }}"
+    tomcat_keystore_alias: "{{ _target_tomcat_keystore_alias | default(common_name) }}"
+    # tomcat_keystore_password: no fallback on purpose -- always supply this
+    # per server in deploy_targets, never commit a real password to this file.
+    tomcat_keystore_password: "{{ _target_tomcat_keystore_password | default('') }}"
+    tomcat_keystore_owner: "{{ _target_tomcat_keystore_owner | default('tomcat') }}"
+    tomcat_keystore_group: "{{ _target_tomcat_keystore_group | default('tomcat') }}"
+    tomcat_keystore_mode: "{{ _target_tomcat_keystore_mode | default('0640') }}"
+    verify_port: "{{ _target_verify_port | default(8443) }}"
+
+  tasks:
+    - name: Assert the keystore password is set
+      assert:
+        that:
+          - tomcat_keystore_password is defined and tomcat_keystore_password | length > 0
+        fail_msg: "tomcat_keystore_password must be supplied per server in deploy_targets (never committed to this file)."
+      no_log: false
+
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      when: preflight_validation_command | length > 0
+      changed_when: false
+
+    - name: Issue/renew the certificate to the Tomcat work directory
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+      vars:
+        acme_reload_cmd: "true"   # the real reload happens after the keystore rebuild below, not here
+
+    - name: Ensure the keystore directory exists
+      file:
+        path: "{{ tomcat_keystore_path | dirname }}"
+        state: directory
+        mode: "0750"
+
+    - name: Build the PKCS12 keystore from the renewed certificate
+      command: >-
+        openssl pkcs12 -export
+        -in {{ acme_fullchain_file }}
+        -inkey {{ acme_key_file }}
+        -name {{ tomcat_keystore_alias }}
+        -out {{ tomcat_keystore_path }}.new
+        -passout env:TOMCAT_KEYSTORE_PW
+      environment:
+        TOMCAT_KEYSTORE_PW: "{{ tomcat_keystore_password }}"
+      no_log: false
+      changed_when: true
+
+    - name: Atomically replace the live keystore
+      copy:
+        src: "{{ tomcat_keystore_path }}.new"
+        dest: "{{ tomcat_keystore_path }}"
+        remote_src: true
+        owner: "{{ tomcat_keystore_owner }}"
+        group: "{{ tomcat_keystore_group }}"
+        mode: "{{ tomcat_keystore_mode }}"
+
+    - name: Remove the staging keystore file
+      file:
+        path: "{{ tomcat_keystore_path }}.new"
+        state: absent
+
+    - name: Restart Tomcat to pick up the new keystore
+      command: "{{ reload_command }}"
+      changed_when: true
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify Tomcat is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ verify_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check verify_port/common_name.') }}"

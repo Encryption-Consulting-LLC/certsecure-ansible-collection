@@ -1,0 +1,69 @@
+---
+# CertSecure ACME renewal playbook -- Apache httpd
+#
+# Same two flows as roles/nginx_deploy/main.yml (see that file's header and
+# docs/design/acme-playbook-variables.md for the full contract). This file
+# (roles_reference/apache_deploy/main.yml) is the untouched, shipped
+# baseline -- see roles/README.md for the full three-tier resolution order
+# (a disk override under roles/apache_deploy/main.yml, or a Mongo-saved edit
+# from PUT /aapIntegration/playbooks/files/apache_deploy, both take
+# precedence over this file).
+
+- hosts: all
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    apache_ssl_dir: "/etc/apache2/ssl/{{ common_name }}"
+    acme_cert_file: "{{ apache_ssl_dir }}/cert.pem"
+    acme_key_file: "{{ apache_ssl_dir }}/key.pem"
+    acme_fullchain_file: "{{ apache_ssl_dir }}/fullchain.pem"
+    acme_ca_file: "{{ apache_ssl_dir }}/chain.pem"
+    acme_reload_cmd: "{{ reload_command }}"
+    # Debian/Ubuntu use "apache2", RHEL/CentOS use "httpd" -- override per host/group.
+    reload_command: >-
+      {{ 'systemctl reload apache2' if ansible_os_family == 'Debian' else 'systemctl reload httpd' }}
+    preflight_validation_command: >-
+      {{ 'apache2ctl configtest' if ansible_os_family == 'Debian' else 'httpd -t' }}
+    cert_file_owner: "root"
+    cert_file_group: "root"
+    cert_file_mode: "0640"
+    verify_port: 443
+
+  tasks:
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      when: preflight_validation_command | length > 0
+      changed_when: false
+
+    - name: Issue/renew the certificate and install it for Apache
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+
+    - name: Set ownership/permissions on the installed certificate material
+      file:
+        path: "{{ item }}"
+        owner: "{{ cert_file_owner }}"
+        group: "{{ cert_file_group }}"
+        mode: "{{ cert_file_mode }}"
+      loop:
+        - "{{ acme_cert_file }}"
+        - "{{ acme_key_file }}"
+        - "{{ acme_fullchain_file }}"
+        - "{{ acme_ca_file }}"
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify Apache is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ verify_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check verify_port/common_name.') }}"

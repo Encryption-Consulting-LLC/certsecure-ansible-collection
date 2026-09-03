@@ -1,0 +1,79 @@
+---
+# Variable contract for mongodb_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). Internal derived variables
+# (mongodb_ssl_dir, acme_cert_file/key_file/fullchain_file/ca_file,
+# mongodb_pem_path) are deliberately not listed here.
+# Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: mongodb_pem_owner
+    type: str
+    required: false
+    default: "mongodb"
+    secret: false
+    description: Owner set on the combined key+certificate PEM MongoDB reads.
+    choices: null
+
+  - name: mongodb_pem_group
+    type: str
+    required: false
+    default: "mongodb"
+    secret: false
+    description: Group set on the combined key+certificate PEM MongoDB reads.
+    choices: null
+
+  - name: mongodb_pem_mode
+    type: str
+    required: false
+    default: "0600"
+    secret: false
+    description: File mode set on the combined key+certificate PEM MongoDB reads.
+    choices: null
+
+  - name: mongodb_hot_rotate
+    type: bool
+    required: false
+    default: true
+    secret: false
+    description: >-
+      Uses db.rotateCertificates() (MongoDB 3.6+, no restart / no dropped
+      connections) instead of a restart.
+    choices: null
+
+  - name: mongodb_rotate_command
+    type: str
+    required: false
+    default: >-
+      mongosh --quiet --port {{ mongodb_port | default(27017) }} --eval
+      "db.rotateCertificates()"
+    secret: false
+    description: >-
+      Only used when mongodb_hot_rotate is true -- a full mongosh/mongo
+      invocation using whatever auth mechanism this deployment actually uses.
+    choices: null
+
+  - name: mongodb_port
+    type: int
+    required: false
+    default: 27017
+    secret: false
+    description: Port MongoDB listens on, used for rotate/verify.
+    choices: null
+
+  - name: reload_command
+    type: str
+    required: false
+    default: "systemctl restart mongod"
+    secret: false
+    description: Used when mongodb_hot_rotate is false.
+    choices: null
+
+  - name: preflight_validation_command
+    type: str
+    required: false
+    default: ""
+    secret: false
+    description: Set to skip; no standard MongoDB config-test equivalent.
+    choices: null

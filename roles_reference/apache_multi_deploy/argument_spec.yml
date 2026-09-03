@@ -1,0 +1,138 @@
+---
+# Variable contract for apache_multi_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). Unlike apache_deploy, the
+# per-server variables are NOT set at the top level here -- they're supplied
+# per-server inside deploy_targets instead; see this playbook's own header
+# comment in main.yml for the full per-server schema.
+# Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: deploy_targets
+    type: list
+    required: true
+    default: null
+    secret: true
+    description: >-
+      One entry per Apache server to renew -- each carries its own connection
+      details (this playbook builds a throwaway inventory at run time, so
+      targets never need to be pre-registered in AAP's own Inventory) and may
+      override any of the per-server variables below. No default -- always
+      supply via extraVars.
+    choices: null
+    options:
+      - name: host
+        type: str
+        required: true
+        default: null
+        secret: false
+        description: >-
+          Dynamic inventory name for this server, and the default for
+          ansible_host/common_name below if those are omitted.
+        choices: null
+      - name: ansible_host
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: Actual IP/FQDN to connect to, if different from host.
+        choices: null
+      - name: ansible_user
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: SSH user for this server.
+        choices: null
+      - name: ansible_port
+        type: int
+        required: false
+        default: null
+        secret: false
+        description: SSH port for this server.
+        choices: null
+      - name: ansible_ssh_private_key_file
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: >-
+          Path (on the Ansible execution node) to the private key used to
+          connect to this server.
+        choices: null
+      - name: ansible_password
+        type: str
+        required: false
+        default: null
+        secret: true
+        description: SSH password for this server, if not using key-based auth.
+        choices: null
+      - name: ansible_become_password
+        type: str
+        required: false
+        default: null
+        secret: true
+        description: sudo/become password for this server, if required.
+        choices: null
+      - name: common_name
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: Primary domain/CN to request for this server. Defaults to host.
+        choices: null
+      - name: subject_alt_names
+        type: list
+        required: false
+        default: []
+        secret: false
+        description: Extra SANs beyond common_name for this server.
+        choices: null
+      - name: reload_command
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: >-
+          Defaults to "systemctl reload apache2" (Debian/Ubuntu) or
+          "systemctl reload httpd" (RHEL/CentOS), auto-detected from
+          ansible_os_family -- override per server to set explicitly.
+        choices: null
+      - name: preflight_validation_command
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: >-
+          Defaults to "apache2ctl configtest" (Debian/Ubuntu) or "httpd -t"
+          (RHEL/CentOS), auto-detected from ansible_os_family. Set to "" to skip.
+        choices: null
+      - name: cert_file_owner
+        type: str
+        required: false
+        default: "root"
+        secret: false
+        description: Owner set on the installed certificate material.
+        choices: null
+      - name: cert_file_group
+        type: str
+        required: false
+        default: "root"
+        secret: false
+        description: Group set on the installed certificate material.
+        choices: null
+      - name: cert_file_mode
+        type: str
+        required: false
+        default: "0640"
+        secret: false
+        description: File mode set on the installed certificate material.
+        choices: null
+      - name: verify_port
+        type: int
+        required: false
+        default: 443
+        secret: false
+        description: Port to TLS-probe for the post-deploy verification check.
+        choices: null

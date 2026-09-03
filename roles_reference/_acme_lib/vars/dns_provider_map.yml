@@ -1,0 +1,44 @@
+---
+# Maps a friendly DNS provider name (as stored in the
+# CertSecure.ACME.Domains collection's "provider" field, see POST
+# /acme/add_domain) to the identifier each ACME client actually wants for its
+# DNS-01 plugin. acme.sh (Linux) and Posh-ACME (Windows) name the same
+# provider differently, so both maps are kept in sync here.
+#
+# dns_provider only needs to be one of the keys below (case-insensitive) --
+# roles/_acme_lib/tasks/issue_linux.yml and issue_windows.yml look it up
+# automatically. If a provider isn't listed, the raw value of dns_provider is
+# passed straight through, so you can also set dns_provider directly to the
+# correct acme.sh/Posh-ACME identifier for a provider that isn't onboarded
+# here yet -- add it below afterwards so future renewals don't need the
+# override repeated.
+#
+# dns_provider_credentials' keys must exactly match what the chosen plugin
+# expects (acme.sh: an environment variable name, e.g. CF_Token,
+# CF_Account_ID; Posh-ACME: a PluginArgs hashtable key, e.g. CFToken) -- see
+# https://github.com/acmesh-official/acme.sh/wiki/dnsapi and
+# https://poshac.me/docs/v4/Plugins/ for the exact names per provider.
+
+dns_provider_map:                 # acme.sh (Linux) dnsapi identifiers
+  cloudflare: dns_cf
+  route53: dns_aws
+  aws: dns_aws
+  azure: dns_azure
+  google: dns_gcloud
+  godaddy: dns_gd
+  digitalocean: dns_do
+  namecheap: dns_namecheap
+  ovh: dns_ovh
+  rfc2136: dns_nsupdate
+
+posh_acme_dns_provider_map:       # Posh-ACME (Windows) plugin names
+  cloudflare: Cloudflare
+  route53: Route53
+  aws: Route53
+  azure: Azure
+  google: GCloud
+  godaddy: GoDaddy
+  digitalocean: DOapi
+  namecheap: Namecheap
+  ovh: OVH
+  rfc2136: RFC2136

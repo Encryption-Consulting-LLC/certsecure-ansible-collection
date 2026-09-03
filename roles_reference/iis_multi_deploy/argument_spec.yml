@@ -1,0 +1,120 @@
+---
+# Variable contract for iis_multi_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). Unlike iis_deploy, the
+# per-server variables are NOT set at the top level here -- they're supplied
+# per-server inside deploy_targets instead; see this playbook's own header
+# comment in main.yml for the full per-server schema.
+# Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: deploy_targets
+    type: list
+    required: true
+    default: null
+    secret: true
+    description: >-
+      One entry per IIS server to renew -- each carries its own WinRM
+      connection details (this playbook builds a throwaway inventory at run
+      time, so targets never need to be pre-registered in AAP's own
+      Inventory) and may override any of the per-server variables below. No
+      default -- always supply via extraVars.
+    choices: null
+    options:
+      - name: host
+        type: str
+        required: true
+        default: null
+        secret: false
+        description: >-
+          Dynamic inventory name for this server, and the default for
+          ansible_host/common_name below if those are omitted.
+        choices: null
+      - name: ansible_host
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: Actual IP/FQDN to connect to, if different from host.
+        choices: null
+      - name: ansible_user
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: WinRM user for this server. Falls back to the shared winrm_user.
+        choices: null
+      - name: ansible_password
+        type: str
+        required: false
+        default: null
+        secret: true
+        description: WinRM password for this server. Falls back to the shared winrm_password.
+        choices: null
+      - name: ansible_port
+        type: int
+        required: false
+        default: 5986
+        secret: false
+        description: WinRM port for this server.
+        choices: null
+      - name: ansible_winrm_transport
+        type: str
+        required: false
+        default: "ntlm"
+        secret: false
+        description: WinRM auth transport for this server (e.g. ntlm, kerberos, basic).
+        choices: null
+      - name: ansible_winrm_server_cert_validation
+        type: str
+        required: false
+        default: "ignore"
+        secret: false
+        description: Set to "validate" if the server presents a trusted WinRM cert.
+        choices: ["ignore", "validate"]
+      - name: common_name
+        type: str
+        required: false
+        default: null
+        secret: false
+        description: Primary domain/CN to request for this server. Defaults to host.
+        choices: null
+      - name: subject_alt_names
+        type: list
+        required: false
+        default: []
+        secret: false
+        description: Extra SANs beyond common_name for this server.
+        choices: null
+      - name: acme_pfx_password
+        type: str
+        required: false
+        default: null
+        secret: true
+        description: >-
+          Protects this server's issued PFX at rest; unrelated to any ACME
+          account secrets. Falls back to the shared acme_pfx_password if not
+          set per server -- one of the two must ultimately be set.
+        choices: null
+      - name: iis_site_name
+        type: str
+        required: false
+        default: "Default Web Site"
+        secret: false
+        description: The IIS site the renewed certificate is bound to on this server.
+        choices: null
+      - name: iis_binding_ip
+        type: str
+        required: false
+        default: "*"
+        secret: false
+        description: IP address of the HTTPS binding on this server (creates it if missing).
+        choices: null
+      - name: iis_binding_port
+        type: int
+        required: false
+        default: 443
+        secret: false
+        description: Port of the HTTPS binding on this server (creates it if missing).
+        choices: null

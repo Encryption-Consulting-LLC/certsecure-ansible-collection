@@ -1,0 +1,138 @@
+---
+# CertSecure ACME renewal playbook -- Microsoft SQL Server
+#
+# Same two flows as roles/nginx_deploy/main.yml (see that file's header and
+# docs/design/acme-playbook-variables.md for the full contract). SQL Server
+# on Linux takes a plain cert/key pair via /etc/mssql/mssql.conf's [network]
+# tlscert/tlskey; SQL Server on Windows takes a certificate from the local
+# machine store (Personal), selected by thumbprint via a registry value --
+# this playbook detects ansible_os_family and does the right one.
+#
+# This file (roles_reference/mssql_deploy/main.yml) is the untouched,
+# shipped baseline -- see roles/README.md for the full three-tier resolution
+# order (a disk override under roles/mssql_deploy/main.yml, or a Mongo-saved
+# edit from PUT /aapIntegration/playbooks/files/mssql_deploy, both take
+# precedence over this file).
+
+- hosts: all
+  # No play-level `become` here: the default become_method (sudo) doesn't
+  # apply to the WinRM connection this playbook's Windows branch uses, and
+  # nothing in this collection can assume the user has separately set
+  # ansible_become_method: runas for Windows hosts in inventory -- the
+  # Linux-only tasks below set `become: true` individually instead (same
+  # pattern as custom_deploy/main.yml).
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    # --- Linux ---
+    mssql_ssl_dir: "/etc/mssql/ssl/{{ common_name }}"
+    acme_cert_file: "{{ mssql_ssl_dir }}/cert.pem"
+    acme_key_file: "{{ mssql_ssl_dir }}/key.pem"
+    acme_fullchain_file: "{{ mssql_ssl_dir }}/fullchain.pem"
+    acme_ca_file: "{{ mssql_ssl_dir }}/chain.pem"
+    mssql_cert_owner: "mssql"
+    mssql_cert_group: "mssql"
+    mssql_cert_mode: "0640"
+    reload_command: "systemctl restart mssql-server"
+    # --- Windows ---
+    acme_pfx_dir: 'C:\CertSecure\acme\{{ common_name }}'
+    acme_pfx_file: '{{ acme_pfx_dir }}\{{ common_name }}.pfx'
+    mssql_instance_key: 'MSSQLServer'      # the registry instance key under Microsoft SQL Server\<version>.<instance>\
+    mssql_service_name: 'MSSQLSERVER'
+    preflight_validation_command: ""
+    mssql_port: 1433
+
+  tasks:
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      become: true
+      when: preflight_validation_command | length > 0 and ansible_os_family != 'Windows'
+      changed_when: false
+
+    # --- Linux: mssql-server reads a plain cert/key pair from mssql.conf ---
+    - name: Issue/renew the certificate for SQL Server on Linux
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+      when: ansible_os_family != 'Windows'
+      vars:
+        acme_reload_cmd: "true"   # mssql-server needs mssql-conf set + a restart, done explicitly below
+
+    - name: Set ownership/permissions on the installed certificate material (Linux)
+      file:
+        path: "{{ item }}"
+        owner: "{{ mssql_cert_owner }}"
+        group: "{{ mssql_cert_group }}"
+        mode: "{{ mssql_cert_mode }}"
+      become: true
+      loop:
+        - "{{ acme_cert_file }}"
+        - "{{ acme_key_file }}"
+        - "{{ acme_fullchain_file }}"
+        - "{{ acme_ca_file }}"
+      when: ansible_os_family != 'Windows'
+
+    - name: Point mssql-server at the renewed certificate (Linux)
+      command: "/opt/mssql/bin/mssql-conf set network.{{ item.key }} {{ item.value }}"
+      become: true
+      loop:
+        - { key: "tlscert", value: "{{ acme_fullchain_file }}" }
+        - { key: "tlskey", value: "{{ acme_key_file }}" }
+      when: ansible_os_family != 'Windows'
+      changed_when: true
+
+    - name: Restart mssql-server to pick up the new certificate (Linux)
+      command: "{{ reload_command }}"
+      become: true
+      when: ansible_os_family != 'Windows'
+      changed_when: true
+
+    # --- Windows: import into the local machine cert store, point the Database
+    #     Engine at it by thumbprint, restart the service ---
+    - name: Issue/renew the certificate for SQL Server on Windows
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_windows.yml"
+      when: ansible_os_family == 'Windows'
+
+    - name: Import the PFX into the local machine Personal certificate store
+      ansible.windows.win_certificate_store:
+        path: "{{ acme_pfx_file }}"
+        password: "{{ acme_pfx_password }}"
+        key_exportable: false
+        key_storage: machine
+        store_location: LocalMachine
+        store_name: My
+        state: present
+      register: _mssql_cert_import
+      when: ansible_os_family == 'Windows'
+      no_log: falsee
+
+    - name: Point the Database Engine at the new certificate's thumbprint
+      ansible.windows.win_regedit:
+        path: 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\{{ mssql_instance_key }}\MSSQLServer\SuperSocketNetLib'
+        name: Certificate
+        data: "{{ _mssql_cert_import.thumbprints[0] }}"
+        type: string
+      when: ansible_os_family == 'Windows'
+
+    - name: Restart the SQL Server service to pick up the new certificate
+      ansible.windows.win_service:
+        name: "{{ mssql_service_name }}"
+        state: restarted
+      when: ansible_os_family == 'Windows'
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify SQL Server is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ mssql_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      when: ansible_os_family != 'Windows'
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result (Linux)
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check mssql_port/common_name.') }}"
+      when: ansible_os_family != 'Windows'

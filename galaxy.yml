@@ -1,0 +1,18 @@
+namespace: encryptionconsulting
+name: certsecure
+version: 3.3.1
+readme: README.md
+authors:
+  - Encryption Consulting LLC
+description: >-
+  Ansible content for deploying and verifying certificates issued by
+  CertSecure Manager, launched by CertSecure via Ansible Automation Platform.
+license:
+  - GPL-2.0-or-later
+tags:
+  - certsecure
+  - certificate
+  - security
+repository: https://github.com/Encryption-Consulting-LLC/certsecure-ansible-collection
+issues: https://github.com/Encryption-Consulting-LLC/certsecure-ansible-collection/issues
+build_ignore: []

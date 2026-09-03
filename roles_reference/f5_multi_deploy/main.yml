@@ -1,0 +1,110 @@
+---
+# CertSecure ACME renewal playbook -- F5 BIG-IP, explicit multi-target
+# (client-SSL profile)
+#
+# Same model as roles_reference/nginx_multi_deploy/main.yml (see that file's
+# header for the "no AAP Inventory registration needed" rationale) applied to
+# F5 BIG-IP -- fitting doubly well here since a BIG-IP device was never going
+# to be an Inventory host in the first place (see below). Use this instead of
+# f5_deploy (the single-target version) when one job run needs to renew certs
+# across several BIG-IP virtual servers / client-SSL profiles, which may or
+# may not all be on the same physical BIG-IP device.
+#
+# F5 BIG-IP has no shell/SSH surface this collection can drive the way it
+# drives Linux/Windows app servers -- everything here goes over F5's own
+# iControl REST API via the `f5networks.f5_modules` collection, which is
+# NOT part of AAP's default execution environment: install it into whatever
+# EE this Job Template runs under (`ansible-galaxy collection install
+# f5networks.f5_modules`, or add it to that EE's requirements.yml) before
+# using this playbook. Every F5-facing task below therefore runs on
+# `localhost` -- the "target" is the BIG-IP's management API, not a machine
+# Ansible connects to over SSH/WinRM.
+#
+# Same two ACME flows as every other playbook in this collection (see
+# roles_reference/nginx_deploy/main.yml's header and
+# docs/design/acme-playbook-variables.md for the full contract), with one
+# important difference: the certificate is issued on the Ansible control
+# node itself (there is no BIG-IP shell to run acme.sh on), so acme_flow:
+# private's HTTP-01 challenge can only be answered if the CONTROL NODE --
+# not the BIG-IP virtual server -- is reachable at common_name:80, which is
+# almost never true for a BIG-IP-fronted domain. In practice, use acme_flow:
+# public (DNS-01) for F5 targets; acme_flow: private only works here if
+# you've separately arranged for the challenge to reach the control node,
+# which this playbook does not set up for you.
+#
+# Every BIG-IP virtual server / client-SSL profile to update is an explicit
+# entry in `deploy_targets` (same "no AAP Inventory registration needed"
+# model as the *_multi_deploy playbooks -- see nginx_multi_deploy/main.yml's
+# header -- since a BIG-IP device is never something Ansible SSHes/WinRMs
+# into as an inventory host anyway). Launch the Job Template against any
+# placeholder inventory (e.g. just "localhost").
+#
+# `deploy_targets` is a list of objects, one per BIG-IP virtual server /
+# client-SSL profile:
+#   bigip_host                   (required) BIG-IP management IP/FQDN
+#   bigip_port                   management API port, defaults to the shared
+#                                 bigip_port below (443)
+#   bigip_user / bigip_password  (required, or fall back to the shared
+#                                 bigip_user/bigip_password below)
+#   bigip_validate_certs         falls back to the shared
+#                                 bigip_validate_certs below (true); set
+#                                 false only for a lab BIG-IP with a
+#                                 self-signed management cert
+#   partition                    BIG-IP partition, falls back to the shared
+#                                 partition below ("Common")
+#   common_name                  (required) CN to request/install
+#   subject_alt_names            defaults to []
+#   ssl_cert_name                 BIG-IP object name for the uploaded cert/key
+#                                 pair; defaults to common_name
+#   client_ssl_profile_name      client-SSL profile to create/update with the
+#                                 new cert/key; defaults to
+#                                 "<ssl_cert_name>-clientssl"
+#   virtual_server_name          optional -- attach client_ssl_profile_name to
+#                                 this virtual server's clientSSL profile list
+#                                 if it isn't already there. Leave unset if
+#                                 the profile is already attached and this run
+#                                 is only rotating the cert/key it points at.
+#   verify_host / verify_port    optional post-deploy TLS probe target
+#                                 (defaults to common_name / 443); set
+#                                 verify_port to "" to skip verification
+#
+# Everything else (acme_flow, acme_account_email, the private/public flow
+# variables, enrollment variables) is shared across the whole run, same as
+# every other playbook here. This file (roles_reference/f5_multi_deploy/main.yml)
+# is the untouched, shipped baseline -- see roles/README.md for the full
+# three-tier resolution order (a disk override under roles/f5_multi_deploy/main.yml,
+# or a Mongo-saved edit from PUT /aapIntegration/playbooks/files/f5_multi_deploy,
+# both take precedence over this file).
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    f5_cert_staging_dir: "/etc/certsecure/acme/f5-staging"
+    bigip_port: 443
+    bigip_validate_certs: true
+    partition: "Common"
+    # bigip_user / bigip_password: no default on purpose -- supply per target
+    # in deploy_targets, or once here/via extraVars if every target shares
+    # one BIG-IP admin account.
+
+  tasks:
+    - name: Assert deploy_targets is a non-empty list
+      assert:
+        that:
+          - deploy_targets is defined
+          - deploy_targets | length > 0
+        fail_msg: >-
+          deploy_targets must be a non-empty list of {bigip_host, common_name, ...}
+          objects -- see this playbook's header comment for the full schema.
+
+    - name: Issue/renew and install the certificate on every explicit F5 target
+      include_tasks: "{{ playbook_dir }}/deploy_one_target.yml"
+      loop: "{{ deploy_targets }}"
+      loop_control:
+        loop_var: f5_target
+        label: "{{ f5_target.common_name | default('?') }} @ {{ f5_target.bigip_host | default('?') }}"

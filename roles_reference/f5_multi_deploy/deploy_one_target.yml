@@ -1,0 +1,130 @@
+---
+# One iteration of f5_multi_deploy/main.yml's loop over deploy_targets --
+# issues the certificate on the control node, then uploads/binds it to one
+# BIG-IP device via iControl REST (f5networks.f5_modules). include_tasks (not
+# import_tasks) so each loop iteration gets its own fresh set_fact scope for
+# common_name/acme_cert_file/etc. -- reusing those across iterations via
+# import_tasks would leak the previous target's values into the assert
+# messages of the next one.
+#
+# Available here: `f5_target` (the current deploy_targets entry, via
+# loop_control.loop_var in main.yml) plus every play-level var from
+# f5_multi_deploy/main.yml (f5_cert_staging_dir, bigip_port,
+# bigip_validate_certs, partition, bigip_user/bigip_password, and everything
+# from _acme_lib/vars/defaults.yml).
+
+- name: Assert this target's required fields are set
+  assert:
+    that:
+      - f5_target.bigip_host is defined and f5_target.bigip_host | length > 0
+      - f5_target.common_name is defined and f5_target.common_name | length > 0
+      - (f5_target.bigip_user | default(bigip_user | default(''))) | length > 0
+      - (f5_target.bigip_password | default(bigip_password | default(''))) | length > 0
+    fail_msg: >-
+      Each deploy_targets entry needs bigip_host and common_name, and either
+      its own bigip_user/bigip_password or the shared bigip_user/bigip_password
+      vars.
+  no_log: false
+
+- name: Resolve this target's variables
+  set_fact:
+    common_name: "{{ f5_target.common_name }}"
+    subject_alt_names: "{{ f5_target.subject_alt_names | default([]) }}"
+    _f5_ssl_cert_name: "{{ f5_target.ssl_cert_name | default(f5_target.common_name) }}"
+    _f5_partition: "{{ f5_target.partition | default(partition) }}"
+    _f5_provider:
+      server: "{{ f5_target.bigip_host }}"
+      server_port: "{{ f5_target.bigip_port | default(bigip_port) }}"
+      user: "{{ f5_target.bigip_user | default(bigip_user | default(omit)) }}"
+      password: "{{ f5_target.bigip_password | default(bigip_password | default(omit)) }}"
+      validate_certs: "{{ f5_target.bigip_validate_certs | default(bigip_validate_certs) }}"
+  no_log: false
+
+- name: Resolve the client-SSL profile name
+  set_fact:
+    _f5_client_ssl_profile_name: "{{ f5_target.client_ssl_profile_name | default(_f5_ssl_cert_name ~ '-clientssl') }}"
+
+- name: Issue, upload and bind the certificate for this target
+  vars:
+    _f5_staging_dir: "{{ f5_cert_staging_dir }}/{{ common_name }}"
+    acme_cert_file: "{{ _f5_staging_dir }}/cert.pem"
+    acme_key_file: "{{ _f5_staging_dir }}/key.pem"
+    acme_fullchain_file: "{{ _f5_staging_dir }}/fullchain.pem"
+    acme_ca_file: "{{ _f5_staging_dir }}/chain.pem"
+    acme_reload_cmd: "true"    # nothing to reload on the control node -- the BIG-IP is updated below instead
+  block:
+    - name: Issue/renew the certificate on the control node
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Read back the issued private key so it can be uploaded to the BIG-IP
+      slurp:
+        src: "{{ acme_key_file }}"
+      register: _f5_key_slurp
+      no_log: false
+
+    - name: Read back the issued fullchain so it can be uploaded to the BIG-IP
+      slurp:
+        src: "{{ acme_fullchain_file }}"
+      register: _f5_chain_slurp
+
+    - name: Upload the private key to the BIG-IP
+      f5networks.f5_modules.bigip_ssl_key:
+        provider: "{{ _f5_provider }}"
+        name: "{{ _f5_ssl_cert_name }}"
+        partition: "{{ _f5_partition }}"
+        content: "{{ _f5_key_slurp.content | b64decode }}"
+        state: present
+      no_log: false
+
+    - name: Upload the certificate (fullchain) to the BIG-IP
+      f5networks.f5_modules.bigip_ssl_certificate:
+        provider: "{{ _f5_provider }}"
+        name: "{{ _f5_ssl_cert_name }}"
+        partition: "{{ _f5_partition }}"
+        content: "{{ _f5_chain_slurp.content | b64decode }}"
+        state: present
+
+    - name: Create/update the client-SSL profile to use the uploaded cert/key
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        provider: "{{ _f5_provider }}"
+        name: "{{ _f5_client_ssl_profile_name }}"
+        partition: "{{ _f5_partition }}"
+        cert_key_chain:
+          - cert: "{{ _f5_ssl_cert_name }}"
+            key: "{{ _f5_ssl_cert_name }}"
+        state: present
+
+    - name: Attach the client-SSL profile to the virtual server
+      f5networks.f5_modules.bigip_virtual_server:
+        provider: "{{ _f5_provider }}"
+        name: "{{ f5_target.virtual_server_name }}"
+        partition: "{{ _f5_partition }}"
+        profiles:
+          - name: "{{ _f5_client_ssl_profile_name }}"
+            context: clientside
+      when: f5_target.virtual_server_name is defined and f5_target.virtual_server_name | length > 0
+
+    - name: Remove the staged certificate material from the control node
+      file:
+        path: "{{ _f5_staging_dir }}"
+        state: absent
+
+- name: Verify the BIG-IP virtual server is serving the new certificate
+  shell: >-
+    echo | openssl s_client -connect
+    {{ f5_target.verify_host | default(common_name) }}:{{ f5_target.verify_port | default(443) }}
+    -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+  register: _f5_verify_result
+  changed_when: false
+  failed_when: false
+  when: (f5_target.verify_port | default(443) | string) | length > 0
+
+- name: Report verification result
+  debug:
+    msg: >-
+      {{ _f5_verify_result.stdout | default('Could not verify -- check verify_host/verify_port/common_name.')
+         if _f5_verify_result is defined else 'Verification skipped (verify_port set to "").' }}

@@ -1,0 +1,87 @@
+---
+# Registers a certificate obtained directly from a public CA (public flow)
+# into CertSecure's own Inventory/Enrollment records via
+# POST /enrollment/enroll-acme-ca-cert (classes/CertificateEnrollment.py) --
+# CertSecure never issued this certificate itself, so without this step it
+# would be invisible to CertSecure's inventory, reporting, and expiry
+# tracking. This records it as a normal CA-issued certificate (the same
+# CertificateAuthority/Template shape Generate Cert/Enroll CSR produce,
+# thirdPartyCert left False) tied to the public CA registered for
+# enroll_url_id -- deliberately NOT the third-party-import path
+# (import-third-party-cert), which is for certificates whose issuing CA
+# CertSecure doesn't manage as a CA at all.
+#
+# Only meaningful for acme_flow: public -- the private flow already gets an
+# Inventory/Enrollment record written automatically by CertSecure's own ACME
+# server as part of issuance, so the calling playbooks only import this file
+# `when: acme_flow == 'public'`.
+#
+# Required: enroll_url_id (the CertSecure.ACME.URL entry this certificate was
+# issued through -- POST /acme/add_url registers its CA the first time that
+# URL is added) and certsecure_api_token (a bearer token with the
+# 'Import Certificate' permission) -- unless enroll_into_certsecure is false.
+
+- name: Assert required enrollment variables are set
+  assert:
+    that:
+      - enroll_url_id is defined and enroll_url_id | length > 0
+      - certsecure_api_token is defined and certsecure_api_token | length > 0
+    fail_msg: >-
+      enroll_url_id and certsecure_api_token must be set to enroll a
+      publicly-issued certificate back into CertSecure, or set
+      enroll_into_certsecure: false to skip this step entirely.
+  when: enroll_into_certsecure | bool
+  no_log: false
+
+- name: Read the issued certificate and chain (Linux)
+  slurp:
+    src: "{{ item }}"
+  loop:
+    - "{{ acme_cert_file }}"
+    - "{{ acme_ca_file | default(acme_fullchain_file) }}"
+  register: _enroll_slurp_linux
+  when: enroll_into_certsecure | bool and ansible_os_family != 'Windows'
+
+# Windows targets never have acme_cert_file/acme_ca_file set -- issue_windows.yml
+# (Posh-ACME) only ever produces a PFX. It separately reads back Posh-ACME's own
+# PEM outputs into _paca_cert_pem_path/_paca_chain_pem_path for exactly this step
+# (see issue_windows.yml), so slurp those instead of the Linux-only path vars.
+- name: Read the issued certificate and chain (Windows)
+  ansible.windows.slurp:
+    src: "{{ item }}"
+  loop:
+    - "{{ _paca_cert_pem_path.stdout | trim }}"
+    - "{{ _paca_chain_pem_path.stdout | trim }}"
+  register: _enroll_slurp_windows
+  when: enroll_into_certsecure | bool and ansible_os_family == 'Windows'
+
+- name: Enroll the certificate into CertSecure's Inventory as a CA-issued certificate
+  uri:
+    url: "{{ certsecure_base_url }}/enrollment/enroll-acme-ca-cert"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ certsecure_api_token }}"
+    body_format: json
+    body:
+      url_id: "{{ enroll_url_id }}"
+      domain_id: "{{ enroll_domain_id | default(omit) }}"
+      cert_data: "{{ (_enroll_slurp_linux.results[0].content if ansible_os_family != 'Windows' else _enroll_slurp_windows.results[0].content) | b64decode }}"
+      cert_chain: "{{ (_enroll_slurp_linux.results[1].content if ansible_os_family != 'Windows' else _enroll_slurp_windows.results[1].content) | b64decode }}"
+      watchers: "{{ enroll_watchers | default([]) }}"
+      tags: "{{ enroll_tags | default([]) }}"
+    # enroll-acme-ca-cert returns 404 (not 200) for "already enrolled, here's
+    # the existing EnrollmentID" -- treated as a soft success so a scheduled
+    # renewal re-run doesn't fail just because nothing changed.
+    status_code: [200, 404]
+    validate_certs: "{{ certsecure_validate_certs | default(true) }}"
+  register: _enroll_result
+  when: enroll_into_certsecure | bool
+  no_log: false
+
+- name: Report enrollment outcome
+  debug:
+    msg: >-
+      {{ 'Enrolled as EnrollmentID ' ~ _enroll_result.json.eid
+         if (_enroll_result.json is defined and 'eid' in _enroll_result.json)
+         else 'Already on file: ' ~ (_enroll_result.json.Error | default('unknown response')) }}
+  when: enroll_into_certsecure | bool and _enroll_result is defined

@@ -1,0 +1,82 @@
+---
+# CertSecure ACME renewal playbook -- nginx
+#
+# Requests/renews a certificate for `common_name` via ACME and installs it
+# for nginx:
+#   acme_flow: private (default) -- CertSecure's own ACME server, HTTP-01,
+#     EAB kid5/hmac. CertSecure already records the issuance in its own
+#     Inventory, so no separate enroll step runs.
+#   acme_flow: public -- a public CA's ACME server directly (e.g. Let's
+#     Encrypt), DNS-01 using CertSecure.ACME.Domains credentials, then
+#     enrolled back into CertSecure via import-third-party-cert so it still
+#     shows up in Inventory/reporting.
+#
+# This file (roles_reference/nginx_deploy/main.yml) is the untouched,
+# shipped baseline -- replaced wholesale by every CertSecure release. A
+# manual/emergency override goes in roles/nginx_deploy/main.yml instead
+# (empty by default, not preserved across an upgrade); an edit saved via
+# PUT /aapIntegration/playbooks/files/nginx_deploy is stored in MongoDB and
+# survives upgrades. Both take precedence over this file -- see
+# roles/README.md for the full three-tier resolution order.
+#
+# Full variable contract, including which variables are secret and how they
+# should be supplied per host: docs/design/acme-playbook-variables.md.
+
+- hosts: all
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    nginx_ssl_dir: "/etc/nginx/ssl/{{ common_name }}"
+    acme_cert_file: "{{ nginx_ssl_dir }}/cert.pem"
+    acme_key_file: "{{ nginx_ssl_dir }}/key.pem"
+    acme_fullchain_file: "{{ nginx_ssl_dir }}/fullchain.pem"
+    acme_ca_file: "{{ nginx_ssl_dir }}/chain.pem"
+    acme_reload_cmd: "{{ reload_command }}"
+    reload_command: "systemctl reload nginx"          # override per host/group if the unit name differs
+    preflight_validation_command: "nginx -t"           # set to "" to skip
+    cert_file_owner: "root"
+    cert_file_group: "root"
+    cert_file_mode: "0640"
+    verify_port: 443                                   # port to TLS-probe for the post-deploy verification check
+    acme_webroot_path: "/var/www/html"                 # nginx's default docroot -- avoids acme.sh's --standalone HTTP-01
+                                                         # listener colliding with nginx already holding :80. Override per
+                                                         # host/group if the vhost's docroot differs.
+
+  tasks:
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      when: preflight_validation_command | length > 0
+      changed_when: false
+
+    - name: Issue/renew the certificate and install it for nginx
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+
+    - name: Set ownership/permissions on the installed certificate material
+      file:
+        path: "{{ item }}"
+        owner: "{{ cert_file_owner }}"
+        group: "{{ cert_file_group }}"
+        mode: "{{ cert_file_mode }}"
+      loop:
+        - "{{ acme_cert_file }}"
+        - "{{ acme_key_file }}"
+        - "{{ acme_fullchain_file }}"
+        - "{{ acme_ca_file }}"
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify nginx is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ verify_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check verify_port/common_name.') }}"

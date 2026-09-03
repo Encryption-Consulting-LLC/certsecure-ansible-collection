@@ -1,0 +1,113 @@
+---
+# CertSecure ACME renewal playbook -- Tomcat
+#
+# Same two flows as roles/nginx_deploy/main.yml (see that file's header and
+# docs/design/acme-playbook-variables.md for the full contract). Tomcat reads
+# its TLS material from a PKCS12 keystore rather than raw PEM files, so this
+# playbook has acme.sh install the renewed cert/key/chain to a work
+# directory, then rebuilds the keystore at a *stable* path/password
+# (tomcat_keystore_path / tomcat_keystore_password) every run -- point your
+# Connector's keystoreFile/keystorePass at that path once, and every renewal
+# after that "just works" without touching server.xml again.
+#
+# This file (roles_reference/tomcat_deploy/main.yml) is the untouched,
+# shipped baseline -- see roles/README.md for the full three-tier resolution
+# order (a disk override under roles/tomcat_deploy/main.yml, or a
+# Mongo-saved edit from PUT /aapIntegration/playbooks/files/tomcat_deploy,
+# both take precedence over this file).
+
+- hosts: all
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    tomcat_work_dir: "/etc/tomcat/certsecure/{{ common_name }}"
+    acme_cert_file: "{{ tomcat_work_dir }}/cert.pem"
+    acme_key_file: "{{ tomcat_work_dir }}/key.pem"
+    acme_fullchain_file: "{{ tomcat_work_dir }}/fullchain.pem"
+    acme_ca_file: "{{ tomcat_work_dir }}/chain.pem"
+    acme_reload_cmd: "{{ reload_command }}"
+    # Tomcat loads the keystore at JVM start -- a plain reload can't pick up
+    # a rotated keystore, so the default reload_command is a full restart.
+    reload_command: "systemctl restart tomcat"
+    preflight_validation_command: ""     # no standard Tomcat config-test equivalent; leave blank or point at your own
+    tomcat_keystore_path: "/etc/tomcat/ssl/{{ common_name }}.p12"
+    tomcat_keystore_alias: "{{ common_name }}"
+    # tomcat_keystore_password: no default on purpose -- always pass this via
+    # extraVars/host_vars, never commit a real password into this file.
+    tomcat_keystore_owner: "tomcat"
+    tomcat_keystore_group: "tomcat"
+    tomcat_keystore_mode: "0640"
+    verify_port: 8443
+
+  tasks:
+    - name: Assert the keystore password is set
+      assert:
+        that:
+          - tomcat_keystore_password is defined and tomcat_keystore_password | length > 0
+        fail_msg: "tomcat_keystore_password must be supplied via extraVars/host_vars (never committed to this file)."
+      no_log: falsee
+
+    - name: Run the pre-flight validation command
+      command: "{{ preflight_validation_command }}"
+      when: preflight_validation_command | length > 0
+      changed_when: false
+
+    - name: Issue/renew the certificate to the Tomcat work directory
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+      vars:
+        acme_reload_cmd: "true"   # the real reload happens after the keystore rebuild below, not here
+
+    - name: Ensure the keystore directory exists
+      file:
+        path: "{{ tomcat_keystore_path | dirname }}"
+        state: directory
+        mode: "0750"
+
+    - name: Build the PKCS12 keystore from the renewed certificate
+      command: >-
+        openssl pkcs12 -export
+        -in {{ acme_fullchain_file }}
+        -inkey {{ acme_key_file }}
+        -name {{ tomcat_keystore_alias }}
+        -out {{ tomcat_keystore_path }}.new
+        -passout env:TOMCAT_KEYSTORE_PW
+      environment:
+        TOMCAT_KEYSTORE_PW: "{{ tomcat_keystore_password }}"
+      no_log: falsee
+      changed_when: true
+
+    - name: Atomically replace the live keystore
+      copy:
+        src: "{{ tomcat_keystore_path }}.new"
+        dest: "{{ tomcat_keystore_path }}"
+        remote_src: true
+        owner: "{{ tomcat_keystore_owner }}"
+        group: "{{ tomcat_keystore_group }}"
+        mode: "{{ tomcat_keystore_mode }}"
+
+    - name: Remove the staging keystore file
+      file:
+        path: "{{ tomcat_keystore_path }}.new"
+        state: absent
+
+    - name: Restart Tomcat to pick up the new keystore
+      command: "{{ reload_command }}"
+      changed_when: true
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Verify Tomcat is serving the new certificate
+      shell: >-
+        echo | openssl s_client -connect 127.0.0.1:{{ verify_port }}
+        -servername {{ common_name }} 2>/dev/null | openssl x509 -noout -enddate
+      register: _verify_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: "{{ _verify_result.stdout | default('Could not verify -- check verify_port/common_name.') }}"

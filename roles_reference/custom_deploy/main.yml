@@ -1,0 +1,127 @@
+---
+# CertSecure ACME renewal playbook -- Custom
+#
+# For any service not covered by the other roles/ playbooks. Same two flows
+# as roles/nginx_deploy/main.yml (see that file's header and
+# docs/design/acme-playbook-variables.md for the full contract), but every
+# app-specific step is an editable variable instead of baked-in logic:
+#   - custom_pre_install_command / custom_post_install_command: arbitrary
+#     shell (Linux) or PowerShell (Windows) run before/after the certificate
+#     material is in place -- custom_post_install_command is where you put
+#     whatever "reload this service" means for your app.
+#   - custom_verify_command: optional, run at the end to confirm the new
+#     certificate is actually live.
+# This is deliberately the least opinionated playbook in the collection --
+# copy it as a starting point for a new per-app playbook rather than editing
+# the other roles/*_deploy files whose defaults assume a specific app.
+#
+# This file (roles_reference/custom_deploy/main.yml) is the untouched,
+# shipped baseline -- see roles/README.md for the full three-tier resolution
+# order (a disk override under roles/custom_deploy/main.yml, or a
+# Mongo-saved edit from PUT /aapIntegration/playbooks/files/custom_deploy,
+# both take precedence over this file).
+
+- hosts: all
+  # No play-level `become` here: ansible_os_family isn't known until facts are
+  # gathered, and gathering facts itself needs `become` already resolved --
+  # templating it off a fact is a chicken-and-egg error. Linux-only tasks
+  # below set `become: true` individually instead; Windows tasks rely on the
+  # WinRM connection's own privileges.
+  vars_files:
+    - "{{ playbook_dir }}/../_acme_lib/vars/defaults.yml"
+    - "{{ playbook_dir }}/../_acme_lib/vars/dns_provider_map.yml"
+  vars:
+    # --- Linux destination paths (ignored on Windows targets) ---
+    custom_work_dir: "/etc/certsecure/custom/{{ common_name }}"
+    acme_cert_file: "{{ custom_work_dir }}/cert.pem"
+    acme_key_file: "{{ custom_work_dir }}/key.pem"
+    acme_fullchain_file: "{{ custom_work_dir }}/fullchain.pem"
+    acme_ca_file: "{{ custom_work_dir }}/chain.pem"
+    custom_file_owner: "root"
+    custom_file_group: "root"
+    custom_file_mode: "0640"
+    # --- Windows destination path (ignored on Linux targets) ---
+    acme_pfx_dir: 'C:\CertSecure\acme\{{ common_name }}'
+    acme_pfx_file: '{{ acme_pfx_dir }}\{{ common_name }}.pfx'
+    # --- hooks: fill these in for your service ---
+    custom_pre_install_command: ""       # optional
+    custom_post_install_command: ""      # required -- your "reload/restart the service" step
+    custom_verify_command: ""            # optional
+
+  tasks:
+    - name: Assert a post-install (reload) command is configured
+      assert:
+        that:
+          - custom_post_install_command is defined and custom_post_install_command | length > 0
+        fail_msg: >-
+          custom_post_install_command must be set to whatever "reload this
+          service" means for your app before this playbook can be used.
+
+    - name: Run the pre-install hook (Linux)
+      command: "{{ custom_pre_install_command }}"
+      become: true
+      when: custom_pre_install_command | length > 0 and ansible_os_family != 'Windows'
+      changed_when: true
+
+    - name: Run the pre-install hook (Windows)
+      ansible.windows.win_shell: "{{ custom_pre_install_command }}"
+      when: custom_pre_install_command | length > 0 and ansible_os_family == 'Windows'
+      changed_when: true
+
+    - name: Issue/renew the certificate (Linux)
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_linux.yml"
+      when: ansible_os_family != 'Windows'
+      vars:
+        acme_reload_cmd: "true"   # the real reload is custom_post_install_command below
+
+    - name: Set ownership/permissions on the installed certificate material (Linux)
+      file:
+        path: "{{ item }}"
+        owner: "{{ custom_file_owner }}"
+        group: "{{ custom_file_group }}"
+        mode: "{{ custom_file_mode }}"
+      become: true
+      loop:
+        - "{{ acme_cert_file }}"
+        - "{{ acme_key_file }}"
+        - "{{ acme_fullchain_file }}"
+        - "{{ acme_ca_file }}"
+      when: ansible_os_family != 'Windows'
+
+    - name: Issue/renew the certificate (Windows)
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/issue_windows.yml"
+      when: ansible_os_family == 'Windows'
+
+    - name: Run the post-install hook (Linux)
+      command: "{{ custom_post_install_command }}"
+      become: true
+      when: ansible_os_family != 'Windows'
+      changed_when: true
+
+    - name: Run the post-install hook (Windows)
+      ansible.windows.win_shell: "{{ custom_post_install_command }}"
+      when: ansible_os_family == 'Windows'
+      changed_when: true
+
+    - name: Enroll a publicly-issued certificate back into CertSecure
+      import_tasks: "{{ playbook_dir }}/../_acme_lib/tasks/enroll_public_ca.yml"
+      when: acme_flow == 'public'
+
+    - name: Run the verify command (Linux)
+      command: "{{ custom_verify_command }}"
+      register: _verify_result_linux
+      when: custom_verify_command | length > 0 and ansible_os_family != 'Windows'
+      changed_when: false
+      failed_when: false
+
+    - name: Run the verify command (Windows)
+      ansible.windows.win_shell: "{{ custom_verify_command }}"
+      register: _verify_result_windows
+      when: custom_verify_command | length > 0 and ansible_os_family == 'Windows'
+      changed_when: false
+      failed_when: false
+
+    - name: Report verification result
+      debug:
+        msg: >-
+          {{ (_verify_result_linux.stdout | default(_verify_result_windows.stdout | default('No custom_verify_command configured.'))) }}

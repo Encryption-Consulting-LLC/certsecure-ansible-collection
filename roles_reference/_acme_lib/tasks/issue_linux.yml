@@ -1,0 +1,197 @@
+---
+# Requests/renews a certificate via ACME on a Linux target using acme.sh,
+# then installs it straight to the paths the calling playbook set in
+# acme_cert_file / acme_key_file / acme_fullchain_file / acme_ca_file,
+# running acme_reload_cmd once the install completes.
+#
+# Supports both flows (see roles/_acme_lib/vars/defaults.yml for the full
+# variable contract):
+#   acme_flow: private -> CertSecure's own ACME server, HTTP-01, EAB kid5/hmac
+#   acme_flow: public  -> the public CA's own ACME server, DNS-01, that CA's
+#                         own EAB if required, DNS provider credentials
+#
+# Required from the calling playbook: common_name, acme_cert_file,
+# acme_key_file, acme_fullchain_file, acme_reload_cmd.
+
+- name: Assert required per-host variables are set
+  assert:
+    that:
+      - common_name is defined and common_name | length > 0
+      - acme_cert_file is defined
+      - acme_key_file is defined
+      - acme_fullchain_file is defined
+      - acme_reload_cmd is defined
+      - acme_account_email is defined and acme_account_email | length > 0
+    fail_msg: >-
+      common_name, acme_cert_file, acme_key_file, acme_fullchain_file,
+      acme_reload_cmd and acme_account_email must all be set (by the calling
+      playbook, or overridden via extraVars/host_vars) before issue_linux.yml
+      can run. acme_account_email must be a real domain -- CertSecure's own
+      ACME server rejects non-routable placeholders like
+      "automation@localhost".
+
+- name: Assert private-flow variables are set
+  assert:
+    that:
+      - certsecure_base_url is defined and 'REPLACE_WITH_CERTSECURE_BACKEND_URL' not in certsecure_base_url
+      - certsecure_eab_kid is defined and certsecure_eab_kid | length > 0
+      - certsecure_eab_hmac is defined and certsecure_eab_hmac | length > 0
+    fail_msg: >-
+      acme_flow=private requires certsecure_base_url, certsecure_eab_kid and
+      certsecure_eab_hmac -- generate an EAB profile via
+      POST /acme/generate_profile and pass its kid5/hmac as
+      certsecure_eab_kid/certsecure_eab_hmac.
+  when: acme_flow == 'private'
+  no_log: false
+
+- name: Assert public-flow variables are set
+  assert:
+    that:
+      - public_ca_directory_url is defined and public_ca_directory_url | length > 0
+      - dns_provider is defined and dns_provider | length > 0
+      - dns_provider_credentials is defined and dns_provider_credentials | length > 0
+    fail_msg: >-
+      acme_flow=public requires public_ca_directory_url, dns_provider and
+      dns_provider_credentials -- resolve these from a
+      CertSecure.ACME.URL / ACME.Domains entry before launching this job.
+  when: acme_flow == 'public'
+  no_log: false
+
+- name: Ensure the acme.sh install directory exists
+  file:
+    path: "{{ acme_sh_install_dir }}"
+    state: directory
+    mode: "0750"
+  become: true
+
+- name: Check whether acme.sh is already installed
+  stat:
+    path: "{{ acme_sh_install_dir }}/acme.sh"
+  register: _acme_sh_bin
+
+- name: Create a scratch directory to install acme.sh from
+  # get.acme.sh's own bootstrap script treats its first positional argument as
+  # an optional "email=..." value and re-mangles it (prepending its own "--"),
+  # so piping our --home/--config-home/--no-cron flags through
+  # `curl https://get.acme.sh | sh -s -- ...` silently breaks: the real
+  # installer chokes on a corrupted flag like "----install-online", but
+  # get.acme.sh's error handling never exits non-zero, so Ansible still saw
+  # "changed: true" with nothing actually installed. Fetching and extracting
+  # the release tarball ourselves (exactly what get.acme.sh does internally)
+  # and invoking the extracted acme.sh directly sidesteps that bootstrap
+  # entirely. A fresh per-run scratch dir (rather than a fixed /tmp path)
+  # keeps this safe if the same host is ever targeted by more than one job at
+  # once.
+  tempfile:
+    state: directory
+    suffix: acme-sh-install
+  register: _acme_sh_scratch
+  become: true
+  when: not _acme_sh_bin.stat.exists
+
+- name: Download and extract the acme.sh release tarball
+  unarchive:
+    src: https://github.com/acmesh-official/acme.sh/archive/master.tar.gz
+    dest: "{{ _acme_sh_scratch.path }}"
+    remote_src: true
+  become: true
+  when: not _acme_sh_bin.stat.exists
+
+- name: Install acme.sh from the extracted source
+  shell: >-
+    ./acme.sh --install-online
+    --home "{{ acme_sh_install_dir }}"
+    --config-home "{{ acme_sh_home }}" --no-cron
+  args:
+    chdir: "{{ _acme_sh_scratch.path }}/acme.sh-master"
+    creates: "{{ acme_sh_install_dir }}/acme.sh"
+  become: true
+  when: not _acme_sh_bin.stat.exists
+  register: _acme_sh_install
+  failed_when: _acme_sh_install.rc is defined and _acme_sh_install.rc != 0
+
+- name: Remove the acme.sh install scratch directory
+  file:
+    path: "{{ _acme_sh_scratch.path }}"
+    state: absent
+  become: true
+  when: not _acme_sh_bin.stat.exists
+
+- name: Build the SAN argument list (common_name plus any subject_alt_names)
+  set_fact:
+    _acme_domain_args: >-
+      -d {{ common_name }}
+      {% for san in subject_alt_names %}-d {{ san }} {% endfor %}
+
+- name: Resolve the acme.sh DNS plugin name for the public flow
+  set_fact:
+    _acme_dns_plugin: "{{ dns_provider_map[dns_provider | lower] | default(dns_provider) }}"
+  when: acme_flow == 'public'
+
+- name: Build the private-flow issuance command (CertSecure's own ACME server, HTTP-01)
+  set_fact:
+    _acme_issue_cmd: >-
+      {{ acme_sh_install_dir }}/acme.sh --issue
+      --home "{{ acme_sh_install_dir }}" --config-home "{{ acme_sh_home }}"
+      {{ _acme_domain_args }}
+      --server "{{ certsecure_acme_directory_url }}"
+      --accountemail "{{ acme_account_email }}"
+      --eab-kid "{{ certsecure_eab_kid }}" --eab-hmac-key "{{ certsecure_eab_hmac }}"
+      {% if acme_webroot_path | length > 0 %}--webroot "{{ acme_webroot_path }}"{% else %}--standalone{% endif %}
+      --keylength {{ 'ec-256' if key_type == 'ecdsa' else key_size }}
+      --force
+  when: acme_flow == 'private'
+  no_log: false
+
+- name: Build the public-flow issuance command (direct to the public CA, DNS-01)
+  set_fact:
+    _acme_issue_cmd: >-
+      {{ acme_sh_install_dir }}/acme.sh --issue
+      --home "{{ acme_sh_install_dir }}" --config-home "{{ acme_sh_home }}"
+      {{ _acme_domain_args }}
+      --server "{{ public_ca_directory_url }}"
+      --accountemail "{{ acme_account_email }}"
+      {% if public_ca_eab_kid | default('') | length > 0 %}--eab-kid "{{ public_ca_eab_kid }}" --eab-hmac-key "{{ public_ca_eab_hmac }}"{% endif %}
+      --dns {{ _acme_dns_plugin }}
+      --dnssleep {{ dns_propagation_wait }}
+      --keylength {{ 'ec-256' if key_type == 'ecdsa' else key_size }}
+      --force
+  when: acme_flow == 'public'
+  no_log: false
+
+- name: Request the certificate
+  shell: "{{ _acme_issue_cmd }}"
+  register: _acme_issue_result
+  environment: "{{ dns_provider_credentials | default({}) }}"
+  become: true
+  # acme.sh exit code 2 means "skipped, existing cert not due for renewal yet" --
+  # treated as a clean no-op, not a failure, so scheduled renewal jobs stay green.
+  changed_when: "'Cert success' in _acme_issue_result.stdout"
+  failed_when: _acme_issue_result.rc not in [0, 2]
+  no_log: false
+
+- name: Ensure destination directories exist
+  file:
+    path: "{{ item | dirname }}"
+    state: directory
+    mode: "0750"
+  loop:
+    - "{{ acme_cert_file }}"
+    - "{{ acme_key_file }}"
+    - "{{ acme_fullchain_file }}"
+    - "{{ acme_ca_file | default(acme_fullchain_file) }}"
+  become: true
+
+- name: Install the certificate to its final destination and trigger the reload
+  shell: >-
+    {{ acme_sh_install_dir }}/acme.sh --install-cert
+    --home "{{ acme_sh_install_dir }}" --config-home "{{ acme_sh_home }}"
+    -d {{ common_name }}
+    --cert-file "{{ acme_cert_file }}"
+    --key-file "{{ acme_key_file }}"
+    --fullchain-file "{{ acme_fullchain_file }}"
+    --ca-file "{{ acme_ca_file | default(acme_fullchain_file) }}"
+    --reloadcmd "{{ acme_reload_cmd }}"
+  become: true
+  register: _acme_install_result
+  changed_when: true

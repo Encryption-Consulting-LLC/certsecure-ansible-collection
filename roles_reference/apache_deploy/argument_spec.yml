@@ -1,0 +1,62 @@
+---
+# Variable contract for apache_deploy, surfaced by
+# GET /aapIntegration/playbooks/files so the UI can pre-fill extra vars.
+# Merged with roles_reference/_acme_lib/vars/argument_spec.yml's shared
+# variables (this file wins on a name collision). Internal derived variables
+# (apache_ssl_dir, acme_cert_file/key_file/fullchain_file/ca_file,
+# acme_reload_cmd) are deliberately not listed here.
+# Prose source of truth: docs/design/acme-playbook-variables.md.
+
+variables:
+  - name: reload_command
+    type: str
+    required: false
+    default: null
+    secret: false
+    description: >-
+      Defaults to "systemctl reload apache2" (Debian/Ubuntu) or
+      "systemctl reload httpd" (RHEL/CentOS), auto-detected from
+      ansible_os_family -- override to set explicitly.
+    choices: null
+
+  - name: preflight_validation_command
+    type: str
+    required: false
+    default: null
+    secret: false
+    description: >-
+      Defaults to "apache2ctl configtest" (Debian/Ubuntu) or "httpd -t"
+      (RHEL/CentOS), auto-detected from ansible_os_family. Set to "" to skip.
+    choices: null
+
+  - name: cert_file_owner
+    type: str
+    required: false
+    default: "root"
+    secret: false
+    description: Owner set on the installed certificate material.
+    choices: null
+
+  - name: cert_file_group
+    type: str
+    required: false
+    default: "root"
+    secret: false
+    description: Group set on the installed certificate material.
+    choices: null
+
+  - name: cert_file_mode
+    type: str
+    required: false
+    default: "0640"
+    secret: false
+    description: File mode set on the installed certificate material.
+    choices: null
+
+  - name: verify_port
+    type: int
+    required: false
+    default: 443
+    secret: false
+    description: Port to TLS-probe for the post-deploy verification check.
+    choices: null
