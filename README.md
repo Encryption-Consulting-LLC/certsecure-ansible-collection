@@ -22,11 +22,7 @@ in this order:
 1. **`roles/<path>`** on disk, if present -- a manual/emergency override.
    Not preserved across a CertSecure upgrade (it ships inside the same build
    artifact as everything else under `static/`).
-2. **MongoDB** (`AAPPlaybookOverrides` collection) -- what
-   `PUT /aapIntegration/playbooks/files/<path>` saves when a playbook is
-   edited. **Survives upgrades**, since Mongo data isn't touched by a
-   redeploy.
-3. **`roles_reference/<path>`** -- the shipped baseline.
+2. **`roles_reference/<path>`** -- the shipped baseline.
 
 This means there is exactly **one** file to update per playbook per
 CertSecure release (`roles_reference/`), and a user's edits (in Mongo)
