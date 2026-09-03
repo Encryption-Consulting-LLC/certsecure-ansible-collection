@@ -55,25 +55,6 @@ standalone playbook (it starts with `- hosts: all`, not a role in the strict
 tasks/handlers/defaults sense). `playbooks/` isn't a name Ansible/AAP
 reserves, so content there is discovered normally.
 
-### Editing a playbook
-
-```bash
-# list every known playbook path and which tier is currently serving it
-GET /aapIntegration/playbooks/files
-
-# read the effective content of one
-GET /aapIntegration/playbooks/files/nginx_deploy/main.yml
-
-# save an edit (validated as parseable YAML, stored in Mongo)
-PUT /aapIntegration/playbooks/files/nginx_deploy/main.yml   {"content": "..."}
-
-# revert to whatever roles/ (if present) or roles_reference/ would serve
-DELETE /aapIntegration/playbooks/files/nginx_deploy/main.yml
-```
-
-All four require the `Configure CertSecure` permission, same as the rest of
-the `/aapIntegration` blueprint.
-
 ### Variable contracts (`argument_spec.yml`)
 
 Alongside each ACME playbook's `main.yml`, and at `_acme_lib/vars/argument_spec.yml`
@@ -180,22 +161,3 @@ Linux targets use [acme.sh](https://github.com/acmesh-official/acme.sh);
 Windows targets use [Posh-ACME](https://poshac.me/) -- both support EAB and a
 wide range of DNS-01 provider plugins, which is what `_acme_lib/vars/dns_provider_map.yml`
 maps `CertSecure.ACME.Domains`' friendly `provider` names onto.
-
-### Adding a new custom playbook
-
-Two ways, depending on whether the edit should survive a CertSecure upgrade:
-
-- **Via the API** (survives upgrades): `GET` `custom_deploy/main.yml`'s
-  content, adapt it, then `PUT` it back under a **new** path, e.g.
-  `PUT /aapIntegration/playbooks/files/my_app_deploy/main.yml`. Since Mongo
-  can serve a path that has no `roles_reference/` counterpart as long as it's
-  first created this way (or exists on disk, see below), it's immediately
-  onboardable as a new AAP job template via
-  `POST /aapIntegration/connections/{name}/jobTemplates/create` with
-  `"playbook": "playbooks/my_app_deploy/main.yml"` (note the `playbooks/`
-  prefix, not `roles/` -- see the callout above).
-- **On disk** (manual, not upgrade-safe): copy
-  `roles_reference/custom_deploy/main.yml` to a new
-  `roles/my_app_deploy/main.yml`, fill in `custom_pre_install_command` /
-  `custom_post_install_command` (and the Linux/Windows destination paths),
-  then onboard it the same way (again with a `"playbook": "playbooks/..."` value).
